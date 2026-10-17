@@ -4,12 +4,15 @@ import { FinancialService } from './application/financial-service';
 import { createDataSource } from './database/data-source';
 import { FinancialController } from './http/financial.controller';
 import { ProviderAuthGuard } from './http/provider-auth.guard';
+import { ReferenceWorker } from './application/reference.worker';
+import { ReconciliationService } from './application/reconciliation.service';
+import { ReconciliationController } from './http/reconciliation.controller';
 
 @Module({
-  controllers: [FinancialController],
+  controllers: [FinancialController, ReconciliationController],
   providers: [
     { provide: DataSource, useFactory: () => createDataSource().initialize() },
-    FinancialService, ProviderAuthGuard,
+    FinancialService, ProviderAuthGuard, ReferenceWorker, ReconciliationService,
   ],
 })
 export class AppModule implements OnApplicationShutdown {
