@@ -414,11 +414,13 @@ describe('HTTP and reconciliation', () => {
       const bet = request(wallet, Kind.Bet);
       const applied = await s.process(bet, keyFor(bet));
       await connection.undoLastMigration({ transaction: 'all' });
+      await connection.undoLastMigration({ transaction: 'all' });
       expect((await s.getWallet(wallet.id)).balance.amount).toBe('90.00');
       await connection.runMigrations({ transaction: 'all' });
       expect(await s.process(bet, keyFor(bet))).toEqual({ ...applied, idempotentReplay: true });
       const refund = request(wallet, Kind.Refund, '10.00', bet.externalTransactionId);
       await s.process(refund, keyFor(refund));
+      await connection.undoLastMigration({ transaction: 'all' });
       expect((await captureFailure(connection.undoLastMigration({ transaction: 'all' }))).message).toContain('stage two history exists');
     } finally { await isolated.close(); }
   });

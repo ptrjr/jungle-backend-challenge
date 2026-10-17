@@ -45,6 +45,7 @@ afterAll(async () => {
     if (sources[0]?.isInitialized) {
       await sources[0].undoLastMigration({ transaction: 'all' });
       await sources[0].undoLastMigration({ transaction: 'all' });
+      await sources[0].undoLastMigration({ transaction: 'all' });
       const [row] = await sources[0].query("SELECT to_regclass('wallets') AS name");
       expect(row.name).toBeNull();
       await sources[0].runMigrations({ transaction: 'all' });

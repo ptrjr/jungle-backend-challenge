@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { ConflictException, Inject, Injectable, NotFoundException, ServiceUnavailableException } from '@nestjs/common';
+import { ConflictException, Inject, Injectable, Logger, NotFoundException, ServiceUnavailableException } from '@nestjs/common';
 import { DataSource, EntityManager } from 'typeorm';
 import { LedgerEntity, LedgerRow, TransactionEntity, TransactionRow, WalletEntity, WalletRow } from '../database/entities';
 import { DomainError } from '../domain/domain-error';
@@ -8,6 +8,9 @@ import { FailureCode, MAX_REFERENCE_ATTEMPTS, WagerTransaction, WagerTransaction
 import { Wallet } from '../domain/wallet';
 import { LedgerDirection, WalletLedgerEntry } from '../domain/wallet-ledger-entry';
 import { payloadHash } from './payload-hash';
+import { EventContext } from '../domain/integration-event';
+import { enqueueFinancialEvents, pendingReferenceContext } from './financial-events';
+import { messagingMetrics } from '../messaging/metrics';
 
 export interface WagerInput {
   providerId: string; externalTransactionId: string; playerId: string; walletId: string;
@@ -23,11 +26,19 @@ export interface TransactionResult {
   referenceAttempts?: number;
 }
 
+export function wagerPayload(input: WagerInput) {
+  return { providerId: input.providerId, externalTransactionId: input.externalTransactionId,
+    playerId: input.playerId, walletId: input.walletId, roundId: input.roundId, gameId: input.gameId,
+    kind: input.kind, money: { amount: input.money.amount, currency: input.money.currency },
+    ...(input.referenceExternalTransactionId !== undefined ? { referenceExternalTransactionId: input.referenceExternalTransactionId } : {}) };
+}
+
 @Injectable()
 export class FinancialService {
+  private readonly logger = new Logger(FinancialService.name);
   constructor(@Inject(DataSource) private readonly source: DataSource) {}
 
-  async openWallet(playerId: string, initialBalance: MoneyProps) {
+  async openWallet(playerId: string, initialBalance: MoneyProps, context: EventContext = { correlationId: randomUUID() }) {
     const wallet = Wallet.open({ id: randomUUID(), playerId, initialBalance: Money.from(initialBalance) });
     try {
       return await this.source.transaction(async manager => {
@@ -41,11 +52,13 @@ export class FinancialService {
           });
           transaction.markProcessed(wallet.balance, new Date());
           await manager.insert(TransactionEntity, this.transactionRow(transaction));
-          await this.insertLedger(manager, WalletLedgerEntry.create({
+          const entry = WalletLedgerEntry.create({
             id: randomUUID(), walletId: wallet.id, transactionId: transaction.id,
             direction: LedgerDirection.Credit, money: wallet.balance,
             balanceBefore: Money.zero(wallet.currency), balanceAfter: wallet.balance, createdAt: new Date(),
-          }));
+          });
+          await this.insertLedger(manager, entry);
+          await enqueueFinancialEvents(manager, wallet, transaction, entry, context, WagerTransactionStatus.Pending);
         }
         return this.walletView(wallet);
       });
@@ -55,15 +68,12 @@ export class FinancialService {
     }
   }
 
-  async process(input: WagerInput, idempotencyKey: string): Promise<TransactionResult> {
-    const hash = payloadHash({
-      providerId: input.providerId, externalTransactionId: input.externalTransactionId,
-      playerId: input.playerId, walletId: input.walletId, roundId: input.roundId, gameId: input.gameId,
-      kind: input.kind, money: { amount: input.money.amount, currency: input.money.currency },
-      ...(input.referenceExternalTransactionId !== undefined ? { referenceExternalTransactionId: input.referenceExternalTransactionId } : {}),
-    });
+  async process(input: WagerInput, idempotencyKey: string, context: EventContext = { correlationId: randomUUID() }, manager?: EntityManager): Promise<TransactionResult> {
+    if (manager && !manager.queryRunner?.isTransactionActive) throw new Error('Financial processing requires an active SQL transaction');
+    const started = performance.now();
+    const hash = payloadHash(wagerPayload(input));
     const transaction = WagerTransaction.create({ ...input, id: randomUUID(), idempotencyKey, payloadHash: hash, money: Money.from(input.money) });
-    return this.source.transaction('READ COMMITTED', async manager => {
+    const execute = async (manager: EntityManager): Promise<TransactionResult> => {
       const existing = await this.findDuplicate(manager, input, idempotencyKey);
       if (existing) return this.replay(existing, idempotencyKey, hash);
 
@@ -79,9 +89,16 @@ export class FinancialService {
         return this.replay(duplicate, idempotencyKey, hash);
       }
 
-      await this.applyTransaction(manager, wallet, transaction, new Date());
+      await this.applyTransaction(manager, wallet, transaction, new Date(), context);
       return this.result(transaction, false);
-    });
+    };
+    if (manager) return execute(manager);
+    const result = await this.source.transaction('READ COMMITTED', execute);
+    messagingMetrics.observe((performance.now() - started) / 1000);
+    if (result.idempotentReplay) messagingMetrics.duplicates++;
+    this.logger.log({ code: 'TRANSACTION_RESULT', correlationId: context.correlationId, messageId: context.messageId ?? null,
+      transactionId: result.transactionId, walletId: input.walletId, providerId: input.providerId, status: result.status });
+    return result;
   }
 
   async reprocessPendingReference(now = new Date()): Promise<boolean> {
@@ -100,12 +117,14 @@ export class FinancialService {
       if (!pending) return false;
       const transaction = this.hydrateTransaction(pending);
       transaction.recordReferenceAttempt();
-      await this.applyTransaction(manager, this.hydrateWallet(row), transaction, now);
+      const context = await pendingReferenceContext(manager, transaction.id);
+      await this.applyTransaction(manager, this.hydrateWallet(row), transaction, now, context);
       return true;
     });
   }
 
-  private async applyTransaction(manager: EntityManager, wallet: Wallet, transaction: WagerTransaction, now: Date): Promise<void> {
+  private async applyTransaction(manager: EntityManager, wallet: Wallet, transaction: WagerTransaction, now: Date, context: EventContext): Promise<void> {
+    const previousStatus = transaction.status;
     let failure: FailureCode | undefined;
     let reference: WagerTransaction | undefined;
     let waiting = false;
@@ -154,6 +173,7 @@ export class FinancialService {
       await this.insertLedger(manager, entry);
       await manager.update(WalletEntity, { id: wallet.id }, this.walletRow(wallet));
     }
+    await enqueueFinancialEvents(manager, wallet, transaction, entry, context, previousStatus);
   }
 
   async getWallet(id: string) {
