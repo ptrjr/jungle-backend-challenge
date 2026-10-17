@@ -46,7 +46,7 @@ export class FinancialController {
       throw new BadRequestException({ code: 'INVALID_IDEMPOTENCY_KEY' });
     }
     const result = await this.service.process(body, key);
-    response.status(result.status === WagerTransactionStatus.Rejected ? 422 : 200);
+    response.status(result.status === WagerTransactionStatus.PendingReference ? 202 : result.status === WagerTransactionStatus.Rejected ? 422 : 200);
     return result;
   }
 

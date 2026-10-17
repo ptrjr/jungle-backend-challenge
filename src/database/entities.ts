@@ -10,6 +10,8 @@ export interface TransactionRow {
   walletId: string; playerId: string; roundId: string; gameId: string; kind: WagerTransactionKind;
   amount: string; currency: string; status: WagerTransactionStatus; failureCode: FailureCode | null;
   resultBalance: string | null; resultCurrency: string | null; createdAt: Date; processedAt: Date | null;
+  referenceExternalTransactionId: string | null; referenceTransactionId: string | null;
+  referenceAttempts: number; nextAttemptAt: Date | null;
 }
 export interface LedgerRow {
   id: string; walletId: string; transactionId: string; direction: LedgerDirection;
@@ -33,6 +35,9 @@ export const TransactionEntity = new EntitySchema<TransactionRow>({
     failureCode: { type: 'varchar', name: 'failure_code', nullable: true },
     resultBalance: { type: 'numeric', name: 'result_balance', nullable: true }, resultCurrency: { type: 'varchar', name: 'result_currency', nullable: true },
     createdAt: { type: 'timestamptz', name: 'created_at' }, processedAt: { type: 'timestamptz', name: 'processed_at', nullable: true },
+    referenceExternalTransactionId: { type: 'varchar', name: 'reference_external_transaction_id', nullable: true },
+    referenceTransactionId: { type: 'uuid', name: 'reference_transaction_id', nullable: true },
+    referenceAttempts: { type: 'integer', name: 'reference_attempts' }, nextAttemptAt: { type: 'timestamptz', name: 'next_attempt_at', nullable: true },
   },
 });
 export const LedgerEntity = new EntitySchema<LedgerRow>({

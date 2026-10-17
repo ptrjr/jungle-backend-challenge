@@ -4,7 +4,7 @@ import { DataSource, EntityManager } from 'typeorm';
 import { LedgerEntity, LedgerRow, TransactionEntity, TransactionRow, WalletEntity, WalletRow } from '../database/entities';
 import { DomainError } from '../domain/domain-error';
 import { Money, MoneyProps } from '../domain/money';
-import { FailureCode, WagerTransaction, WagerTransactionKind, WagerTransactionStatus } from '../domain/wager-transaction';
+import { FailureCode, MAX_REFERENCE_ATTEMPTS, WagerTransaction, WagerTransactionKind, WagerTransactionStatus } from '../domain/wager-transaction';
 import { Wallet } from '../domain/wallet';
 import { LedgerDirection, WalletLedgerEntry } from '../domain/wallet-ledger-entry';
 import { payloadHash } from './payload-hash';
@@ -12,12 +12,15 @@ import { payloadHash } from './payload-hash';
 export interface WagerInput {
   providerId: string; externalTransactionId: string; playerId: string; walletId: string;
   roundId: string; gameId: string;
-  kind: WagerTransactionKind.Bet | WagerTransactionKind.Win | WagerTransactionKind.Loss;
+  kind: Exclude<WagerTransactionKind, WagerTransactionKind.Opening>;
   money: MoneyProps;
+  referenceExternalTransactionId?: string;
 }
 export interface TransactionResult {
   transactionId: string; status: WagerTransactionStatus; balance: MoneyProps;
   failureCode?: FailureCode; idempotentReplay: boolean;
+  nextAttemptAt?: string;
+  referenceAttempts?: number;
 }
 
 @Injectable()
@@ -53,7 +56,12 @@ export class FinancialService {
   }
 
   async process(input: WagerInput, idempotencyKey: string): Promise<TransactionResult> {
-    const hash = payloadHash(input);
+    const hash = payloadHash({
+      providerId: input.providerId, externalTransactionId: input.externalTransactionId,
+      playerId: input.playerId, walletId: input.walletId, roundId: input.roundId, gameId: input.gameId,
+      kind: input.kind, money: { amount: input.money.amount, currency: input.money.currency },
+      ...(input.referenceExternalTransactionId !== undefined ? { referenceExternalTransactionId: input.referenceExternalTransactionId } : {}),
+    });
     const transaction = WagerTransaction.create({ ...input, id: randomUUID(), idempotencyKey, payloadHash: hash, money: Money.from(input.money) });
     return this.source.transaction('READ COMMITTED', async manager => {
       const existing = await this.findDuplicate(manager, input, idempotencyKey);
@@ -71,29 +79,81 @@ export class FinancialService {
         return this.replay(duplicate, idempotencyKey, hash);
       }
 
-      let failure: FailureCode | undefined;
-      let entry: WalletLedgerEntry | undefined;
-      if (wallet.playerId !== input.playerId) failure = 'PLAYER_MISMATCH';
-      else if (wallet.currency !== input.money.currency) failure = 'CURRENCY_MISMATCH';
-      else if (input.kind === WagerTransactionKind.Bet && wallet.balance.isLessThan(transaction.money)) failure = 'INSUFFICIENT_FUNDS';
-      else {
+      await this.applyTransaction(manager, wallet, transaction, new Date());
+      return this.result(transaction, false);
+    });
+  }
+
+  async reprocessPendingReference(now = new Date()): Promise<boolean> {
+    return this.source.transaction('READ COMMITTED', async manager => {
+      // All financial paths lock wallet before transaction to avoid lock-order deadlocks.
+      const row = await manager.createQueryBuilder(WalletEntity, 'wallet')
+        .where(`EXISTS (SELECT 1 FROM wager_transactions t WHERE t.wallet_id = wallet.id
+          AND t.status = 'PENDING_REFERENCE' AND t.next_attempt_at <= :now)`, { now })
+        .orderBy('wallet.id', 'ASC').setLock('pessimistic_write').setOnLocked('skip_locked').take(1).getOne();
+      if (!row) return false;
+      const pending = await manager.createQueryBuilder(TransactionEntity, 'transaction')
+        .where('transaction.walletId = :id AND transaction.status = :status AND transaction.nextAttemptAt <= :now', {
+          id: row.id, status: WagerTransactionStatus.PendingReference, now,
+        }).orderBy('transaction.nextAttemptAt', 'ASC').addOrderBy('transaction.id', 'ASC')
+        .setLock('pessimistic_write').setOnLocked('skip_locked').take(1).getOne();
+      if (!pending) return false;
+      const transaction = this.hydrateTransaction(pending);
+      transaction.recordReferenceAttempt();
+      await this.applyTransaction(manager, this.hydrateWallet(row), transaction, now);
+      return true;
+    });
+  }
+
+  private async applyTransaction(manager: EntityManager, wallet: Wallet, transaction: WagerTransaction, now: Date): Promise<void> {
+    let failure: FailureCode | undefined;
+    let reference: WagerTransaction | undefined;
+    let waiting = false;
+    let entry: WalletLedgerEntry | undefined;
+    if (wallet.playerId !== transaction.playerId) failure = 'PLAYER_MISMATCH';
+    else if (wallet.currency !== transaction.money.currency) failure = 'CURRENCY_MISMATCH';
+    else if (transaction.referenceExternalTransactionId !== undefined) {
+      const referenceRow = await manager.findOneBy(TransactionEntity, {
+        providerId: transaction.providerId, externalTransactionId: transaction.referenceExternalTransactionId,
+      });
+      if (referenceRow) {
+        reference = this.hydrateTransaction(referenceRow);
+        failure = transaction.referenceFailure(reference);
+      }
+      if (!failure && (!reference || !reference.isTerminal())) {
+        if (transaction.referenceAttempts >= MAX_REFERENCE_ATTEMPTS) {
+          failure = reference ? 'REFERENCE_NOT_PROCESSED' : 'REFERENCE_NOT_FOUND';
+        } else waiting = true;
+      }
+      if (!failure && !waiting && reference && transaction.requiresReference()) {
+        const reversed = await manager.existsBy(TransactionEntity, {
+          referenceTransactionId: reference.id, kind: transaction.kind, status: WagerTransactionStatus.Processed,
+        });
+        if (reversed) failure = 'REFERENCE_ALREADY_REVERSED';
+      }
+    }
+    if (!failure && !waiting && transaction.affectsBalance()) {
+      const direction = transaction.ledgerDirectionFor(reference);
+      if (direction === LedgerDirection.Debit && wallet.balance.isLessThan(transaction.money)) {
+        failure = transaction.requiresReference() ? 'REVERSAL_INSUFFICIENT_FUNDS' : 'INSUFFICIENT_FUNDS';
+      } else {
         try {
-          if (input.kind === WagerTransactionKind.Bet) entry = wallet.debit(transaction.money, transaction.id);
-          if (input.kind === WagerTransactionKind.Win) entry = wallet.credit(transaction.money, transaction.id);
+          entry = direction === LedgerDirection.Debit
+            ? wallet.debit(transaction.money, transaction.id) : wallet.credit(transaction.money, transaction.id);
         } catch (error) {
           if (error instanceof DomainError && error.code === 'MONEY_OUT_OF_RANGE') failure = 'BALANCE_LIMIT_EXCEEDED';
           else throw error;
         }
       }
-      if (failure) transaction.reject(failure, wallet.balance, new Date());
-      else transaction.markProcessed(wallet.balance, new Date());
-      await manager.update(TransactionEntity, { id: transaction.id }, this.transactionRow(transaction));
-      if (entry) {
-        await this.insertLedger(manager, entry);
-        await manager.update(WalletEntity, { id: wallet.id }, this.walletRow(wallet));
-      }
-      return this.result(transaction, false);
-    });
+    }
+    if (failure) transaction.reject(failure, wallet.balance, now);
+    else if (waiting) transaction.markPendingReference(wallet.balance, now);
+    else transaction.markProcessed(wallet.balance, now, reference?.id);
+    await manager.update(TransactionEntity, { id: transaction.id }, this.transactionRow(transaction));
+    if (entry) {
+      await this.insertLedger(manager, entry);
+      await manager.update(WalletEntity, { id: wallet.id }, this.walletRow(wallet));
+    }
   }
 
   async getWallet(id: string) {
@@ -140,7 +200,7 @@ export class FinancialService {
     const transaction = this.hydrateTransaction(row);
     if (transaction.idempotencyKey !== key) throw new ConflictException({ code: 'EXTERNAL_TRANSACTION_CONFLICT' });
     if (!transaction.matchesPayload(hash)) throw new ConflictException({ code: 'IDEMPOTENCY_CONFLICT' });
-    if (!transaction.isTerminal()) throw new ServiceUnavailableException({ code: 'TRANSACTION_IN_PROGRESS' });
+    if (transaction.status === WagerTransactionStatus.Pending) throw new ServiceUnavailableException({ code: 'TRANSACTION_IN_PROGRESS' });
     return this.result(transaction, true);
   }
   private result(transaction: WagerTransaction, replay: boolean): TransactionResult {
@@ -148,6 +208,9 @@ export class FinancialService {
     return {
       transactionId: transaction.id, status: transaction.status, balance: transaction.resultBalance.toJSON(),
       ...(transaction.failureCode ? { failureCode: transaction.failureCode } : {}), idempotentReplay: replay,
+      ...(transaction.status === WagerTransactionStatus.PendingReference ? {
+        nextAttemptAt: transaction.nextAttemptAt!.toISOString(), referenceAttempts: transaction.referenceAttempts,
+      } : {}),
     };
   }
   private transactionView(row: TransactionRow) {
@@ -156,6 +219,8 @@ export class FinancialService {
       externalTransactionId: row.externalTransactionId, walletId: row.walletId, playerId: row.playerId,
       roundId: row.roundId, gameId: row.gameId, kind: row.kind,
       money: this.money(row.amount, row.currency).toJSON(), createdAt: row.createdAt.toISOString(), processedAt: row.processedAt?.toISOString(),
+      referenceExternalTransactionId: row.referenceExternalTransactionId,
+      referenceTransactionId: row.referenceTransactionId, referenceAttempts: row.referenceAttempts,
     };
   }
   private walletView(wallet: Wallet) {
@@ -172,6 +237,9 @@ export class FinancialService {
       amount: transaction.money.toString(), currency: transaction.money.currency, status: transaction.status,
       failureCode: transaction.failureCode ?? null, resultBalance: transaction.resultBalance?.toString() ?? null,
       resultCurrency: transaction.resultBalance?.currency ?? null, createdAt: transaction.createdAt, processedAt: transaction.processedAt ?? null,
+      referenceExternalTransactionId: transaction.referenceExternalTransactionId ?? null,
+      referenceTransactionId: transaction.referenceTransactionId ?? null,
+      referenceAttempts: transaction.referenceAttempts, nextAttemptAt: transaction.nextAttemptAt ?? null,
     };
   }
   private async insertLedger(manager: EntityManager, entry: WalletLedgerEntry): Promise<void> {
@@ -189,6 +257,8 @@ export class FinancialService {
     return WagerTransaction.rehydrate({
       ...row, money: this.money(row.amount, row.currency), failureCode: row.failureCode ?? undefined,
       processedAt: row.processedAt ?? undefined,
+      referenceExternalTransactionId: row.referenceExternalTransactionId ?? undefined,
+      referenceTransactionId: row.referenceTransactionId ?? undefined, nextAttemptAt: row.nextAttemptAt ?? undefined,
       resultBalance: row.resultBalance !== null && row.resultCurrency ? this.money(row.resultBalance, row.resultCurrency) : undefined,
     });
   }
