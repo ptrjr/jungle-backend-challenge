@@ -23,9 +23,10 @@ export class InboxProcessor {
       }).onConflict('DO NOTHING').returning('message_id').execute();
       if (inserted.raw.length === 0) {
         const existing = await manager.findOneByOrFail(InboxEntity, { consumerName: inbox.consumerName, messageId: inbox.messageId });
-        if (existing.payloadHash !== hash) throw new ConflictException({ code: 'INBOX_PAYLOAD_CONFLICT' });
-        if (!existing.processedAt || !existing.transactionId) throw new ServiceUnavailableException({ code: 'INBOX_IN_PROGRESS' });
-        return { transactionId: existing.transactionId, idempotentReplay: true };
+        const receipt = InboxMessage.rehydrate({ ...existing, processedAt: existing.processedAt ?? undefined, transactionId: existing.transactionId ?? undefined });
+        if (receipt.payloadHash !== hash) throw new ConflictException({ code: 'INBOX_PAYLOAD_CONFLICT' });
+        if (!receipt.isProcessed() || !receipt.transactionId) throw new ServiceUnavailableException({ code: 'INBOX_IN_PROGRESS' });
+        return { transactionId: receipt.transactionId, idempotentReplay: true };
       }
       const result = await this.financial.process(input, idempotencyKey, {
         correlationId: message.correlationId ?? message.messageId, causationId: message.messageId, messageId: message.messageId,

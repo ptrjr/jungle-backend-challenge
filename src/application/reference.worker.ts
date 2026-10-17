@@ -6,6 +6,7 @@ export class ReferenceWorker implements OnApplicationBootstrap, BeforeApplicatio
   private readonly logger = new Logger(ReferenceWorker.name);
   private timer?: ReturnType<typeof setInterval>;
   private inFlight?: Promise<void>;
+  private stopping = false;
 
   constructor(@Inject(FinancialService) private readonly service: FinancialService) {}
 
@@ -21,12 +22,13 @@ export class ReferenceWorker implements OnApplicationBootstrap, BeforeApplicatio
   }
 
   async runBatch(now = new Date()): Promise<void> {
-    for (let processed = 0; processed < 25; processed++) {
+    for (let processed = 0; !this.stopping && processed < 25; processed++) {
       if (!await this.service.reprocessPendingReference(now)) break;
     }
   }
 
   async beforeApplicationShutdown(): Promise<void> {
+    this.stopping = true;
     if (this.timer) clearInterval(this.timer);
     await this.inFlight;
   }

@@ -4,6 +4,7 @@ import { FinancialService } from '../application/financial-service';
 import { WagerTransactionStatus } from '../domain/wager-transaction';
 import { CreateWagerDto, CreateWalletDto } from './dto';
 import { ProviderAuthGuard } from './provider-auth.guard';
+import { randomUUID } from 'node:crypto';
 
 @Controller()
 @UseGuards(ProviderAuthGuard)
@@ -11,8 +12,9 @@ export class FinancialController {
   constructor(@Inject(FinancialService) private readonly service: FinancialService) {}
 
   @Post('wallets')
-  open(@Body(new ValidationPipe({ ...bodyValidationOptions(), expectedType: CreateWalletDto })) body: CreateWalletDto) {
-    return this.service.openWallet(body.playerId, body.initialBalance);
+  open(@Body(new ValidationPipe({ ...bodyValidationOptions(), expectedType: CreateWalletDto })) body: CreateWalletDto,
+    @Headers('x-correlation-id') correlationId?: string) {
+    return this.service.openWallet(body.playerId, body.initialBalance, requestContext(correlationId));
   }
   @Get('wallets/:walletId')
   wallet(@Param('walletId', ParseUUIDPipe) id: string) { return this.service.getWallet(id); }
@@ -41,11 +43,12 @@ export class FinancialController {
     @Body(new ValidationPipe({ ...bodyValidationOptions(), expectedType: CreateWagerDto })) body: CreateWagerDto,
     @Headers('idempotency-key') key: string | undefined,
     @Res({ passthrough: true }) response: Response,
+    @Headers('x-correlation-id') correlationId?: string,
   ) {
     if (!key || key.length > 256 || key.trim() !== key || !/\S/.test(key)) {
       throw new BadRequestException({ code: 'INVALID_IDEMPOTENCY_KEY' });
     }
-    const result = await this.service.process(body, key);
+    const result = await this.service.process(body, key, requestContext(correlationId));
     response.status(result.status === WagerTransactionStatus.PendingReference ? 202 : result.status === WagerTransactionStatus.Rejected ? 422 : 200);
     return result;
   }
@@ -61,4 +64,11 @@ export class FinancialController {
 
 function bodyValidationOptions() {
   return { transform: true, whitelist: true, forbidNonWhitelisted: true, forbidUnknownValues: true };
+}
+
+function requestContext(correlationId?: string) {
+  if (correlationId !== undefined && (!correlationId.trim() || correlationId.trim() !== correlationId || correlationId.length > 128)) {
+    throw new BadRequestException({ code: 'INVALID_CORRELATION_ID' });
+  }
+  return { correlationId: correlationId ?? randomUUID() };
 }

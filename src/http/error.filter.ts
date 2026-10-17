@@ -2,6 +2,7 @@ import { ArgumentsHost, Catch, ExceptionFilter, HttpException, Logger } from '@n
 import type { Response } from 'express';
 import { QueryFailedError } from 'typeorm';
 import { DomainError, InvalidTransactionStateError } from '../domain/domain-error';
+import { messagingMetrics } from '../messaging/metrics';
 
 @Catch()
 export class ErrorFilter implements ExceptionFilter {
@@ -14,6 +15,7 @@ export class ErrorFilter implements ExceptionFilter {
     }
     const code = error && typeof error === 'object' && 'code' in error ? String(error.code) : undefined;
     const databaseCode = error instanceof QueryFailedError ? (error.driverError as { code?: string }).code : code;
+    if (databaseCode === '55P03' || databaseCode === '40P01') messagingMetrics.lockConflicts++;
     const connectionTimeout = error instanceof Error && [
       'Connection terminated unexpectedly', 'Connection terminated due to connection timeout', 'timeout exceeded when trying to connect',
     ].includes(error.message);
