@@ -1,4 +1,4 @@
-# Decisões das Etapas 1 e 2
+# Decisões das Etapas 1 a 3
 
 ## Organização e persistência
 
@@ -67,8 +67,32 @@ Divergências não provocam correção. Geram log estruturado com walletId e inc
 
 Não há autenticação. `ProviderAuthGuard` é o ponto de extensão explícito: uma implementação futura validaria tokens OIDC de IdP externo e autorizaria o provider da requisição; não haverá tabela própria de senhas. A API local confia no provider informado.
 
-Etapa 3: inbox/outbox, eventos tipados, SQS, publishers, retry/backoff de mensagens, DLQ e shutdown de mensagens. **Nenhum evento é publicado nesta etapa e ainda não há registro de eventos para publicação futura**, inclusive nas rejeições por expiração. A integração deverá gravar a outbox dentro de `applyTransaction`, usando o mesmo `EntityManager`, antes do commit. Não há callback em memória após commit como garantia de entrega.
+## Inbox, eventos e entrega
 
-Etapa 4: health de processo/dependências, correlação e métricas completas, testes reais em três processos e recuperação após falhas de workers. A paginação atual usa sequência global crescente codificada com o walletId em base64url; é estável para operações da mesma wallet porque são serializadas no banco. Não é um snapshot: novos lançamentos podem aparecer nas páginas seguintes.
+O consumidor valida o envelope e usa `InboxProcessor`, que abre a transação SQL e insere `(consumerName, messageId, payloadHash)`. O hash canônico inclui campos de negócio e a chave de idempotência; horário e correlação de transporte ficam fora. Uma entrega idêntica já confirmada não executa o financeiro novamente. O mesmo messageId com payload diferente é conflito permanente e vai à DLQ, preservando o recibo original.
+
+`FinancialService.process` aceita o EntityManager da transação externa somente quando ela está ativa. HTTP abre sua própria transação; SQS passa a da inbox. As regras financeiras continuam em `applyTransaction`. Os eventos são inseridos no mesmo commit da transação, ledger e saldo. Falha na outbox desfaz inclusive a inbox. O ack é posterior a esse commit, e uma falha no ack permite redelivery sem novo débito/crédito.
+
+Os quatro eventos concretos herdam `IntegrationEvent`, com `eventType/version` definidos na classe e Money serializado como strings. `eventId` é também o ID da outbox e permanece estável entre tentativas. Há unicidade por transação e tipo de evento. OPENING gera eventos; LOSS gera somente `WagerTransactionProcessed`. Pendência gera um evento na entrada no estado, e sua resolução/expiração gera o evento terminal correspondente. A correlação original do worker de referências é recuperada do evento de pendência persistido.
+
+O publisher seleciona uma linha da outbox com `FOR UPDATE SKIP LOCKED`, publica e confirma o resultado na mesma transação SQL. O lock fica na linha da outbox durante a chamada SQS, sem bloquear a wallet. Essa escolha evita leases e seus protocolos adicionais; o custo é ocupar uma conexão durante a chamada de rede, limitada a cinco segundos. Falhas agendam backoff persistido de 1 segundo até 5 minutos. Não há limite que apague/descarte eventos confirmados; lag e pendências permitem diagnosticar falhas prolongadas.
+
+Não existe transação distribuída PostgreSQL/SQS. Se o envio chegou ao broker e o processo morreu antes do commit SQL, a linha volta a ficar pendente e é publicada novamente com o mesmo eventId. A deduplicação FIFO não é uma garantia de integridade; as tentativas têm deduplication IDs de transporte distintos. Os consumidores dos eventos precisam deduplicar por eventId. Publicadores concorrentes podem alterar a ordem de envio de eventos da mesma wallet; `walletVersion` e o ledger permitem interpretar mudanças sem depender dessa ordem.
+
+Tentativas contabilizam resultados confirmados no PostgreSQL, inclusive publicação bem-sucedida. Uma tentativa interrompida pode reaparecer sem incremento porque sua transação foi desfeita. A imutabilidade de payload/identidade e as transições de inbox/outbox são protegidas por triggers. O downgrade de inbox/outbox remove histórico de entrega e não deve ser aplicado sobre eventos que ainda precisam ser preservados. Não há backfill de eventos das Etapas 1/2 já confirmados antes da migration.
+
+## SQS, falhas e shutdown
+
+LocalStack usa credenciais fictícias e três filas FIFO separadas. Solicitações têm visibilidade de 60 segundos com heartbeat; erros transitórios ajustam a visibilidade com backoff de 1 até 60 segundos. O broker encaminha à DLQ após cinco recebimentos. Erros permanentes de contrato, identidade ou integridade são enviados à DLQ explicitamente; o original só é removido depois desse envio. Uma falha entre envio à DLQ e remoção também pode gerar cópias. A DLQ preserva o envelope para análise/redrive; esse redrive é operacional, sem endpoint de reexecução automática.
+
+Rejeições financeiras são terminais, com inbox e evento persistidos, e recebem ack. Falhas que impedem commit não deixam uma transação financeira aceita no banco: a evidência fica no envelope da DLQ e nos logs, sem criar `FAILED` artificial após rollback. `FAILED` continua reservado no modelo. A indisponibilidade temporária do PostgreSQL faz o consumer tentar novamente; a do SQS impede ack/envio e permite recuperação posterior. A outbox nunca considera a ausência de resposta como publicação confirmada.
+
+Cada instância processa uma mensagem de entrada por vez e pode publicar até 25 eventos por rodada. O polling usa long polling de dois segundos. Em SIGTERM, Nest chama os hooks: o consumer interrompe novas buscas e conclui a mensagem em andamento; publishers e worker de referências param de selecionar novos itens, aguardando a operação atual antes do DataSource fechar. O Compose concede 45 segundos. Morte forçada continua segura: leases de visibilidade expiram, locks SQL são liberados e o estado persistido decide a próxima ação.
+
+Logs JSON contêm os identificadores disponíveis de correlação, mensagem, transação, wallet e provider, sem payload financeiro completo. `/metrics` expõe estado das transações, duplicatas, retries, encaminhamentos explícitos à DLQ, profundidade aproximada da DLQ (inclusive redrive do broker), conflitos de lock, publicações, pendências/lag da outbox e latência. Contadores locais reiniciam com o processo; estado financeiro e lag vêm do banco. `/health/live` verifica o processo; `/health/ready` consulta PostgreSQL e as três filas, sem autenticação.
+
+Os testes usam PostgreSQL e LocalStack reais, filas/schemas exclusivos e Toxiproxy para interromper conexões apenas dos clientes de teste. Fixtures isoladas suspendem um processo após commit/antes de ack e após publicação/antes do commit, que o teste encerra com SIGKILL. Isso comprovou um débito e publicação repetida com eventId estável, respectivamente. O shutdown com mensagem em andamento é verificado pelo hook real, com uma barreira de teste após o commit. O timer e os efeitos de banco/fila não são substituídos por mocks.
+
+Etapa 4: validação final com pelo menos três processos financeiros simultâneos, 50 mensagens duplicadas em paralelo e revisão dos critérios eliminatórios. Os testes concorrentes atuais usam três pools; os testes de crash usam subprocessos reais, sem comprovar três instâncias financeiras ativas simultaneamente. A paginação usa sequência global crescente codificada com o walletId em base64url e não representa um snapshot: novos lançamentos podem aparecer nas páginas seguintes.
 
 Na validação em Windows, matchers assíncronos `expect(promise).rejects.toThrow` provocaram timeouts/crashes no Bun 1.4.3 e 1.3.14. Os testes de integração aguardam a operação em `try/catch` e verificam a exceção recebida. A suíte passou com esse formato no Bun 1.3.14, versão fixada para reprodução.
