@@ -1,4 +1,4 @@
-# Decisões das Etapas 1 a 3
+# Decisões e validação final
 
 ## Organização e persistência
 
@@ -61,7 +61,7 @@ Os testes de expiração fornecem o instante ao reprocessamento para avançar a 
 
 `POST /wallets/:walletId/reconciliation` usa uma única consulta com agregação do ledger. O snapshot do statement PostgreSQL inclui saldo e lançamentos confirmados no mesmo instante, mesmo com movimentações concorrentes. Soma e diferença são calculadas como `numeric` no PostgreSQL e serializadas como strings, inclusive divergências fora do limite operacional de Money. Apenas a contagem de lançamentos usa `number`.
 
-Divergências não provocam correção. Geram log estruturado com walletId e incrementam um contador por processo exposto em `/metrics`; esse contador reinicia com a aplicação, como contadores usuais de métricas. A observabilidade completa continua pendente. O teste de corrupção desabilita temporariamente apenas o trigger de consistência de wallets no schema isolado de teste, e restaura o saldo manualmente depois da verificação; a aplicação não possui esse caminho.
+Divergências não provocam correção. Geram log estruturado com walletId e incrementam um contador por processo exposto em `/metrics`; esse contador reinicia com a aplicação, como contadores usuais de métricas. O teste de corrupção desabilita temporariamente apenas o trigger de consistência de wallets no schema isolado de teste, e restaura o saldo manualmente depois da verificação; a aplicação não possui esse caminho.
 
 ## Limites e próximos passos
 
@@ -93,6 +93,14 @@ Logs JSON contêm os identificadores disponíveis de correlação, mensagem, tra
 
 Os testes usam PostgreSQL e LocalStack reais, filas/schemas exclusivos e Toxiproxy para interromper conexões apenas dos clientes de teste. Fixtures isoladas suspendem um processo após commit/antes de ack e após publicação/antes do commit, que o teste encerra com SIGKILL. Isso comprovou um débito e publicação repetida com eventId estável, respectivamente. O shutdown com mensagem em andamento é verificado pelo hook real, com uma barreira de teste após o commit. O timer e os efeitos de banco/fila não são substituídos por mocks.
 
-Etapa 4: validação final com pelo menos três processos financeiros simultâneos, 50 mensagens duplicadas em paralelo e revisão dos critérios eliminatórios. Os testes concorrentes atuais usam três pools; os testes de crash usam subprocessos reais, sem comprovar três instâncias financeiras ativas simultaneamente. A paginação usa sequência global crescente codificada com o walletId em base64url e não representa um snapshot: novos lançamentos podem aparecer nas páginas seguintes.
+A validação distribuída usa três processos Bun executando a aplicação NestJS completa, com portas atribuídas pelo sistema. Cada conexão é identificada por `application_name`; o teste bloqueia uma wallet e verifica em `pg_stat_activity` que processos distintos aguardam locks antes de liberar a disputa. As 50 requisições HTTP são distribuídas entre os três servidores. As 50 entregas SQS têm IDs de deduplicação e grupos FIFO distintos: o broker não serializa nem elimina as cópias como garantia financeira. Após o reinício, cada consumer registra duplicatas, há um recibo de inbox e um débito; publishers retomam a outbox pendente. Um backlog maior que o lote de um publisher permite observar publicações em pelo menos dois processos. Wallets distintas concluem operações enquanto outra wallet continua bloqueada.
+
+O custo O(n) da conferência do ledger não provocou timeout nem inconsistência nesses cenários. Isso comprova o volume exercitado, sem estabelecer capacidade para histórico longo ou meta de throughput. Nenhuma otimização foi aplicada. A paginação usa sequência global crescente codificada com o walletId em base64url e não representa um snapshot: novos lançamentos podem aparecer nas páginas seguintes.
+
+O ciclo completo das três migrations down/up e a reaplicação sem alterações foram testados em schema vazio. O comando `migration:revert` verifica histórico e mantém locks de tabela até concluir o downgrade na mesma transação SQL; recusa remover inbox/outbox preenchidas ou tabelas financeiras com dados. A proteção específica da Etapa 2 permanece na própria migration. As implementações `down` originais da migration inicial e da outbox continuam destrutivas se invocadas diretamente pelo ORM por um administrador: use o comando documentado. O histórico não pode ser convertido automaticamente para um schema que não representa suas operações.
+
+O teste `test:broker` usa outro projeto Compose, porta dinâmica e volume exclusivo, com a mesma imagem e configuração de persistência. No LocalStack 4.10.0 executado aqui, filas, uma solicitação não consumida e dois eventos já publicados desapareceram após reiniciar o container. O volume foi preservado, mas `PERSISTENCE=1` não garantiu persistência SQS nesse ambiente. Não reiniciamos o broker utilizado manualmente.
+
+A outbox recuperou os dois eventos ainda não publicados a partir de uma nova conexão PostgreSQL. Os dois eventos já marcados como publicados permaneceram no histórico SQL e não foram republicados automaticamente. Portanto, a recuperação automática cobre falhas do publisher e eventos pendentes; não cobre perda de mensagens já aceitas pelo broker ou solicitações perdidas antes do commit. Para entrega fora do ambiente do desafio, é necessária durabilidade efetiva do broker e uma política operacional de reenvio/restauração. Não há replay administrativo implementado. Essa limitação local não altera as garantias de atomicidade e idempotência no PostgreSQL.
 
 Na validação em Windows, matchers assíncronos `expect(promise).rejects.toThrow` provocaram timeouts/crashes no Bun 1.4.3 e 1.3.14. Os testes de integração aguardam a operação em `try/catch` e verificam a exceção recebida. A suíte passou com esse formato no Bun 1.3.14, versão fixada para reprodução.

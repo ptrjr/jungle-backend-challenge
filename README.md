@@ -2,7 +2,7 @@
 
 Implementação incremental do [desafio oficial](https://github.com/junglegaming/backend-challenge). O enunciado original está preservado em [docs/CHALLENGE.md](docs/CHALLENGE.md).
 
-Etapas 1 a 3: operações financeiras, ledger, idempotência, concorrência por wallet, referências fora de ordem, reconciliação, SQS, inbox/outbox e recuperação de workers. A validação distribuída final da Etapa 4 permanece pendente.
+Operações financeiras, ledger, idempotência, concorrência por wallet, referências fora de ordem, reconciliação, SQS e inbox/outbox. A auditoria final e as evidências reproduzíveis estão em [docs/VALIDATION.md](docs/VALIDATION.md).
 
 ## Executar
 
@@ -10,11 +10,13 @@ Requisitos: Bun **1.3.14**, Docker e Docker Compose v2. A aplicação usa NestJS
 
 ```sh
 bun install --frozen-lockfile
+# PowerShell: Copy-Item .env.example .env
+cp .env.example .env
 docker compose up -d --wait postgres localstack
 docker compose run --rm --no-deps sqs-init
 ```
 
-Copie `.env.example` para `.env` (`cp .env.example .env` ou `Copy-Item .env.example .env` no PowerShell). O PostgreSQL do Compose usa a porta externa **55432**; a comunicação entre containers usa `postgres:5432`. Bun carrega `.env` automaticamente.
+O padrão versionado é a porta PostgreSQL **5432**. Se estiver ocupada, defina `POSTGRES_PORT=55432` e ajuste a porta de `DATABASE_URL` no `.env`; a comunicação entre containers continua em `postgres:5432`. Bun e Compose carregam `.env` automaticamente. A configuração local desta validação foi preservada em **55432**, fora dos commits.
 
 ```sh
 bun run migration:run
@@ -35,7 +37,7 @@ bun run start
 bun run migration:revert
 ```
 
-`build` gera `dist/`; `start` executa o fonte com Bun. Para executar a saída compilada: `bun dist/main.js`. `migration:revert` desfaz somente a última migration. A migration de inbox/outbox remove o histórico de entrega ao ser revertida; use apenas em banco descartável ou após preservar esse histórico. A migration de referências recusa reversão quando há histórico da Etapa 2. A migration inicial remove as tabelas financeiras ao ser revertida.
+`build` gera `dist/`; `start` executa o fonte com Bun. Para executar a saída compilada: `bun dist/main.js`. `migration:revert` desfaz somente a última migration. O comando recusa remover tabelas com histórico financeiro ou de entrega; a migration de referências também recusa histórico incompatível com a versão anterior. O ciclo completo down/up foi testado em schema vazio. Pare os processos antes de administrar migrations; não use diretamente o ORM para contornar essas pré-condições.
 
 ## Testar
 
@@ -46,15 +48,23 @@ bun test test/unit
 docker compose --profile test up -d --wait postgres-test localstack toxiproxy
 docker compose run --rm --no-deps sqs-init
 bun run test:integration
+bun run test:distributed
+bun run test:broker
 ```
 
 `TEST_DATABASE_URL` deve apontar para um banco separado cujo nome termine em `_test`. O valor de `.env.example` usa a porta **5433**. Os testes criam e removem seu próprio schema e não usam mocks do PostgreSQL. O usuário de teste precisa poder criar schemas. Sem a variável, a suíte falha explicitamente.
+
+`test:distributed` inicia três processos Bun/NestJS independentes em portas livres do sistema, com o mesmo schema PostgreSQL e filas privadas. Uma barreira SQL e `pg_stat_activity` comprovam sobreposição entre processos. Valida `80 + 80` sobre `100`, 50 duplicatas HTTP, wallets distintas e 50 duplicatas SQS após reinício. Os logs registram PIDs, portas e resultados. `test:broker` exige acesso ao Docker, cria um projeto Compose isolado com porta dinâmica, reinicia somente esse broker e encerra seus containers; mantém o volume criado pelo teste. Nenhum desses testes reinicia o broker principal nem remove volumes existentes.
 
 São cobertos: precisão decimal, transições, todas as operações, saldo insuficiente, identidade e validade de referências, replay com saldo original, duplicação e reversões concorrentes em três pools independentes, disputa `80 + 80` sobre `100`, falhas injetadas, constraints, imutabilidade, contratos HTTP, timeout de lock e paginação. Os novos testes incluem workers concorrentes, backoff/expiração, referências encadeadas, reconciliação concorrente/divergente e migration down/up preservando histórico anterior.
 
 Os testes criam filas e schemas privados. Toxiproxy interrompe conexões reais apenas dos clientes de teste. Dois testes criam e encerram subprocessos Bun em pontos controlados: após commit/antes de ack e após publicação/antes da confirmação SQL. No Windows, a execução precisa permitir criação de processos. `bunfig.toml` desativa os workers automáticos nos testes, inclusive se `.env` habilitar mensageria; os testes do agendador os iniciam explicitamente.
 
 Validação da Etapa 3 em Windows/Bun 1.3.14, PostgreSQL 18.1 e LocalStack 4.10.0 em containers: **38 testes unitários e 52 de integração aprovados**, mantendo os 68 testes anteriores. Typecheck, build e instalação com lockfile congelado passaram. O Compose também foi validado com envio real de solicitações SQS, duplicata, publicação dos eventos, ROLLBACK fora de ordem, reconciliação, métricas e health. O Bun local está em `.local/bun`, pasta ignorada pelo Git; instale a versão indicada no PATH para usar os comandos acima.
+
+O teste isolado de reinício detectou perda de filas e mensagens no LocalStack 4.10.0 utilizado, mesmo com `PERSISTENCE=1` e volume. Não há promessa de durabilidade desse broker local. A outbox recupera eventos ainda pendentes no PostgreSQL; eventos já marcados como publicados não são reenviados automaticamente, e solicitações ainda não confirmadas no SQL dependem da retenção do broker ou reenvio do produtor. Detalhes em [ARCHITECTURE.md](ARCHITECTURE.md).
+
+Validação final: **96 testes aprovados** — 38 unitários, 53 de integração, quatro distribuídos e um de reinício do broker. Os 90 anteriores continuam passando. Typecheck, build local/Docker e instalação com lockfile congelado aprovados. O teste de broker mede e registra a limitação acima; sua aprovação não significa persistência garantida.
 
 ## API implementada
 
