@@ -5,6 +5,7 @@ import { WagerTransactionStatus } from '../domain/wager-transaction';
 import { CreateWagerDto, CreateWalletDto } from './dto';
 import { ProviderAuthGuard } from './provider-auth.guard';
 import { randomUUID } from 'node:crypto';
+import { NO_NUL, validCorrelationId } from './input-validation';
 
 @Controller()
 @UseGuards(ProviderAuthGuard)
@@ -21,6 +22,7 @@ export class FinancialController {
 
   @Get('wallets/:walletId/ledger')
   ledger(@Param('walletId', ParseUUIDPipe) id: string, @Query('limit') limitString?: string, @Query('cursor') cursor?: string) {
+    id = id.toLowerCase();
     const limit = limitString === undefined ? 50 : Number(limitString);
     if (!Number.isInteger(limit) || limit < 1 || limit > 100 || (limitString !== undefined && !/^\d+$/.test(limitString))) {
       throw new BadRequestException({ code: 'INVALID_LIMIT' });
@@ -30,7 +32,7 @@ export class FinancialController {
       try {
         if (cursor.length > 512 || !/^[A-Za-z0-9_-]+$/.test(cursor)) throw new Error();
         const decoded: unknown = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'));
-        if (!decoded || typeof decoded !== 'object' || !('walletId' in decoded) || decoded.walletId !== id || !('after' in decoded)
+        if (!decoded || typeof decoded !== 'object' || !('walletId' in decoded) || typeof decoded.walletId !== 'string' || decoded.walletId.toLowerCase() !== id || !('after' in decoded)
           || typeof decoded.after !== 'string' || !/^[1-9]\d{0,18}$/.test(decoded.after) || BigInt(decoded.after) > 9223372036854775807n) throw new Error();
         after = decoded.after;
       } catch { throw new BadRequestException({ code: 'INVALID_CURSOR' }); }
@@ -45,7 +47,7 @@ export class FinancialController {
     @Res({ passthrough: true }) response: Response,
     @Headers('x-correlation-id') correlationId?: string,
   ) {
-    if (!key || key.length > 256 || key.trim() !== key || !/\S/.test(key)) {
+    if (!key || key.length > 256 || key.trim() !== key || !/\S/.test(key) || !NO_NUL.test(key)) {
       throw new BadRequestException({ code: 'INVALID_IDEMPOTENCY_KEY' });
     }
     const result = await this.service.process(body, key, requestContext(correlationId));
@@ -58,6 +60,7 @@ export class FinancialController {
 
   @Get('providers/:providerId/wagering/transactions/:externalTransactionId')
   providerTransaction(@Param('providerId') provider: string, @Param('externalTransactionId') external: string) {
+    if (!NO_NUL.test(provider) || !NO_NUL.test(external)) throw new BadRequestException({ code: 'INVALID_IDENTIFIER' });
     return this.service.getProviderTransaction(provider, external);
   }
 }
@@ -67,7 +70,7 @@ function bodyValidationOptions() {
 }
 
 function requestContext(correlationId?: string) {
-  if (correlationId !== undefined && (!correlationId.trim() || correlationId.trim() !== correlationId || correlationId.length > 128)) {
+  if (correlationId !== undefined && !validCorrelationId(correlationId)) {
     throw new BadRequestException({ code: 'INVALID_CORRELATION_ID' });
   }
   return { correlationId: correlationId ?? randomUUID() };

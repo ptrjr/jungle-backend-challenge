@@ -28,9 +28,14 @@ export interface TransactionResult {
 
 export function wagerPayload(input: WagerInput) {
   return { providerId: input.providerId, externalTransactionId: input.externalTransactionId,
-    playerId: input.playerId, walletId: input.walletId, roundId: input.roundId, gameId: input.gameId,
+    playerId: input.playerId.toLowerCase(), walletId: input.walletId.toLowerCase(), roundId: input.roundId, gameId: input.gameId,
     kind: input.kind, money: { amount: input.money.amount, currency: input.money.currency },
     ...(input.referenceExternalTransactionId !== undefined ? { referenceExternalTransactionId: input.referenceExternalTransactionId } : {}) };
+}
+
+export function persistedWagerPayload(row: TransactionRow) {
+  return wagerPayload({ ...row, kind: row.kind as WagerInput['kind'], money: { amount: row.amount, currency: row.currency },
+    referenceExternalTransactionId: row.referenceExternalTransactionId ?? undefined });
 }
 
 @Injectable()
@@ -39,6 +44,7 @@ export class FinancialService {
   constructor(@Inject(DataSource) private readonly source: DataSource) {}
 
   async openWallet(playerId: string, initialBalance: MoneyProps, context: EventContext = { correlationId: randomUUID() }) {
+    playerId = playerId.toLowerCase();
     const wallet = Wallet.open({ id: randomUUID(), playerId, initialBalance: Money.from(initialBalance) });
     try {
       return await this.source.transaction(async manager => {
@@ -69,6 +75,7 @@ export class FinancialService {
   }
 
   async process(input: WagerInput, idempotencyKey: string, context: EventContext = { correlationId: randomUUID() }, manager?: EntityManager): Promise<TransactionResult> {
+    input = { ...input, playerId: input.playerId.toLowerCase(), walletId: input.walletId.toLowerCase() };
     if (manager && !manager.queryRunner?.isTransactionActive) throw new Error('Financial processing requires an active SQL transaction');
     const started = performance.now();
     const hash = payloadHash(wagerPayload(input));
@@ -195,6 +202,7 @@ export class FinancialService {
   }
 
   async getLedger(walletId: string, limit: number, after?: string) {
+    walletId = walletId.toLowerCase();
     await this.getWallet(walletId);
     const query = this.source.manager.createQueryBuilder(LedgerEntity, 'entry')
       .where('entry.walletId = :walletId', { walletId }).orderBy('entry.sequence', 'ASC').take(limit + 1);
@@ -219,7 +227,9 @@ export class FinancialService {
   private replay(row: TransactionRow, key: string, hash: string): TransactionResult {
     const transaction = this.hydrateTransaction(row);
     if (transaction.idempotencyKey !== key) throw new ConflictException({ code: 'EXTERNAL_TRANSACTION_CONFLICT' });
-    if (!transaction.matchesPayload(hash)) throw new ConflictException({ code: 'IDEMPOTENCY_CONFLICT' });
+    if (!transaction.matchesPayload(hash) && payloadHash(persistedWagerPayload(row)) !== hash) {
+      throw new ConflictException({ code: 'IDEMPOTENCY_CONFLICT' });
+    }
     if (transaction.status === WagerTransactionStatus.Pending) throw new ServiceUnavailableException({ code: 'TRANSACTION_IN_PROGRESS' });
     return this.result(transaction, true);
   }

@@ -1,6 +1,7 @@
 import { ConflictException, Inject, Injectable, ServiceUnavailableException } from '@nestjs/common';
 import { DataSource } from 'typeorm';
-import { FinancialService, wagerPayload } from '../application/financial-service';
+import { FinancialService, persistedWagerPayload, wagerPayload } from '../application/financial-service';
+import { TransactionEntity } from '../database/entities';
 import { payloadHash } from '../application/payload-hash';
 import { InboxEntity } from '../database/delivery-entities';
 import { InboxMessage } from '../domain/inbox-message';
@@ -24,7 +25,12 @@ export class InboxProcessor {
       if (inserted.raw.length === 0) {
         const existing = await manager.findOneByOrFail(InboxEntity, { consumerName: inbox.consumerName, messageId: inbox.messageId });
         const receipt = InboxMessage.rehydrate({ ...existing, processedAt: existing.processedAt ?? undefined, transactionId: existing.transactionId ?? undefined });
-        if (receipt.payloadHash !== hash) throw new ConflictException({ code: 'INBOX_PAYLOAD_CONFLICT' });
+        if (receipt.payloadHash !== hash) {
+          const transaction = receipt.transactionId ? await manager.findOneBy(TransactionEntity, { id: receipt.transactionId }) : null;
+          if (!transaction || payloadHash({ ...persistedWagerPayload(transaction), idempotencyKey: transaction.idempotencyKey }) !== hash) {
+            throw new ConflictException({ code: 'INBOX_PAYLOAD_CONFLICT' });
+          }
+        }
         if (!receipt.isProcessed() || !receipt.transactionId) throw new ServiceUnavailableException({ code: 'INBOX_IN_PROGRESS' });
         return { transactionId: receipt.transactionId, idempotentReplay: true };
       }

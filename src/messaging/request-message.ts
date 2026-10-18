@@ -3,20 +3,21 @@ import { BadRequestException } from '@nestjs/common';
 import { plainToInstance, Type } from 'class-transformer';
 import { Equals, IsISO8601, IsNotEmpty, IsObject, IsString, Matches, MaxLength, ValidateIf, ValidateNested, validateSync } from 'class-validator';
 import { CreateWagerDto } from '../http/dto';
+import { CORRELATION_ID, NO_NUL } from '../http/input-validation';
 
 class SqsWagerDto extends CreateWagerDto {
-  @IsString() @IsNotEmpty() @MaxLength(256) @Matches(/^\S(?:.*\S)?$/)
+  @IsString() @IsNotEmpty() @MaxLength(256) @Matches(/^\S(?:.*\S)?$/) @Matches(NO_NUL)
   idempotencyKey!: string;
 }
 export class RequestedWagerMessage {
-  @IsString() @IsNotEmpty() @Matches(/\S/) @MaxLength(128)
+  @IsString() @IsNotEmpty() @Matches(/\S/) @MaxLength(128) @Matches(NO_NUL)
   messageId!: string;
   @Equals('WagerTransactionRequested')
   type!: string;
   @IsISO8601({ strict: true })
   occurredAt!: string;
   @ValidateIf((_object: unknown, value: unknown) => value !== undefined)
-  @IsString() @IsNotEmpty() @MaxLength(128)
+  @IsString() @IsNotEmpty() @MaxLength(128) @Matches(CORRELATION_ID) @Matches(NO_NUL)
   correlationId?: string;
   @IsObject() @ValidateNested() @Type(() => SqsWagerDto)
   data!: SqsWagerDto;

@@ -6,6 +6,7 @@ import { WagerTransactionProcessed } from '../../src/domain/integration-event';
 import { WagerTransaction, WagerTransactionKind } from '../../src/domain/wager-transaction';
 import { Money } from '../../src/domain/money';
 import { parseRequestedMessage } from '../../src/messaging/request-message';
+import { validCorrelationId } from '../../src/http/input-validation';
 
 function event() {
   const money = Money.from({ amount: '0.00', currency: 'BRL' });
@@ -16,6 +17,20 @@ function event() {
   return WagerTransactionProcessed.from(transaction, { correlationId: 'correlation', causationId: 'request' });
 }
 describe('delivery domain', () => {
+  test('HTTP and SQS share correlation validation while omission remains allowed', () => {
+    const body = { messageId: 'message', type: 'WagerTransactionRequested', occurredAt: new Date().toISOString(),
+      data: { providerId: 'provider', externalTransactionId: 'bet', idempotencyKey: 'key', playerId: randomUUID(), walletId: randomUUID(),
+        roundId: 'round', gameId: 'game', kind: 'BET', money: { amount: '1.00', currency: 'BRL' } } };
+    expect(parseRequestedMessage(JSON.stringify(body)).correlationId).toBeUndefined();
+    for (const value of ['', ' ', '\t', ' trace', 'trace ', 'bad\u0000id', 'x'.repeat(129)]) {
+      expect(validCorrelationId(value)).toBe(false);
+      expect(() => parseRequestedMessage(JSON.stringify({ ...body, correlationId: value }))).toThrow();
+    }
+    for (const value of ['trace', 'Trace With Spaces', 'x'.repeat(128)]) {
+      expect(validCorrelationId(value)).toBe(true);
+      expect(parseRequestedMessage(JSON.stringify({ ...body, correlationId: value })).correlationId).toBe(value);
+    }
+  });
   test('inbox factory and processed transition are persistent-state compatible and terminal', () => {
     const inbox = InboxMessage.receive({ consumerName: 'consumer', messageId: 'message', payloadHash: 'a'.repeat(64) });
     expect(inbox.isProcessed()).toBe(false);

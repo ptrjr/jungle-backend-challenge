@@ -19,6 +19,7 @@ export class ReconciliationService {
   constructor(@Inject(DataSource) private readonly source: DataSource) {}
 
   async reconcile(walletId: string) {
+    walletId = walletId.toLowerCase();
     const rows: ReconciliationRow[] = await this.source.query(`
       WITH balances AS (
         SELECT w.id AS wallet_id, w.currency, w.balance AS stored_balance,
