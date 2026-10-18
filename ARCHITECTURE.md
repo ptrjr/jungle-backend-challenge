@@ -1,106 +1,80 @@
-# Decisões e validação final
+# Decisões de arquitetura
 
-## Organização e persistência
+## Domínio e persistência
 
-`domain/` contém classes sem dependência de NestJS/ORM, com construtores privados, factories e transições explícitas. `application/financial-service.ts` coordena uma transação SQL por comando. Controllers validam o contrato e traduzem resultados para HTTP. Não há barramento interno, factories de repositórios ou camadas genéricas.
+`domain/` contém classes sem dependências de NestJS ou ORM, com factories, construtores privados/protegidos e transições explícitas. `rehydrate` reconstrói estado persistido sem reaplicar regras de transição. `FinancialService` coordena o caso de uso compartilhado por HTTP e SQS. Controllers validam contratos; `EntitySchema` separa os registros TypeORM das classes de domínio e evita dependência de decorators de persistência no domínio.
 
-TypeORM foi escolhido pela familiaridade do candidato. `EntitySchema` mapeia registros de persistência separados das classes de domínio; o serviço chama `rehydrate` ao reconstruir o estado. Isso também evita depender da emissão de metadados de propriedades pelo transpiler do Bun. A injeção de dependências usa `@Inject` explícito e os DTOs informam seu tipo ao `ValidationPipe`.
+TypeORM oferece transações e locks PostgreSQL explícitos, mantendo o fluxo financeiro em um único `EntityManager`. A injeção usa `@Inject` explícito e os DTOs informam seu tipo ao `ValidationPipe`, compatível com o transpiler do Bun.
 
-`Money` usa `decimal.js`, precisão de 40 dígitos, operações imutáveis e strings de escala 2. Valores negativos existem no domínio para subtrações/diferenças; os contratos de entrada os recusam. Não há arredondamento de entradas inválidas. Limite: `999999999999999999.99`. O banco usa um domain sobre `numeric` com validação de escala/faixa; `numeric(20,2)` arredondaria entradas com casas excedentes antes da constraint. O driver PostgreSQL mantém decimais como strings. A API restringe moeda a BRL; o modelo preserva a moeda e impede operações entre moedas diferentes.
+`Money` usa `decimal.js` com precisão de 40 dígitos, operações imutáveis e strings de escala 2. O limite é `999999999999999999.99`; entradas inválidas não são arredondadas. O banco usa um domain sobre `numeric` que valida escala e faixa: `numeric(20,2)` arredondaria antes da constraint. O driver mantém decimais como strings. BRL é a única moeda exposta; o domínio mantém moeda e rejeita operações incompatíveis. Diferenças negativas existem no domínio/reconciliação, mas não nos contratos de entrada.
 
-## Concorrência, atomicidade e histórico
+## Identidade, validação e hashes
 
-O processamento bloqueia a linha da wallet com `SELECT FOR UPDATE` em `READ COMMITTED`. A leitura do saldo, decisão, atualização, transação e ledger ficam na mesma transação SQL. O lock é por wallet e funciona entre processos; wallets diferentes não compartilham lock. Locks são liberados no commit/rollback. Timeouts de lock/statement produzem falha transitória, sem retry automático HTTP.
+Player/wallet UUIDs são normalizados antes da criação de entidades, hash e eventos no serviço compartilhado. A abertura segue a mesma política. Consultas PostgreSQL tratam UUIDs sem diferença de caixa; paginação e reconciliação também canonicalizam os identificadores que retornam/comparam. Provider, ID externo, rodada, jogo e chave de idempotência preservam caixa.
 
-A inserção da operação vem **depois** do lock da wallet para evitar upgrades concorrentes dos locks da FK. A unicidade no banco continua decidindo conflitos entre wallets/chaves. `ON CONFLICT DO NOTHING` permite consultar a operação vencedora em um novo statement sem manter uma transação SQL abortada por violação de unicidade.
+SHA-256 recebe JSON canônico de provider, ID externo, player, wallet, round, game, kind, money e referência opcional. As chaves de objetos são ordenadas recursivamente; transporte e header ficam fora. A inbox acrescenta a chave de idempotência ao seu hash. UUIDs são normalizados em ambos os cálculos.
 
-O schema impõe unicidade player/moeda, chave global de idempotência, provider/ID externo e transação no ledger; valores não negativos; aritmética do lançamento; FKs; identidade/versão da wallet; bloqueio de UPDATE/DELETE/TRUNCATE do ledger e de alterações em transações terminais. Constraint triggers diferidos verificam no commit o vínculo entre transação processada e ledger e a igualdade `wallet.balance = soma do ledger`.
+Hashes históricos podem conter UUIDs com outra grafia. Em um replay cujo hash não coincide, o serviço compara o hash canônico dos campos de negócio imutáveis já persistidos. A inbox faz a mesma verificação pela transação vinculada, incluindo sua chave. Isso aceita equivalência de UUID sem ignorar diferenças nos demais campos e sem reescrever hashes, saldos ou resultados. Uma rejeição antiga continua rejeitada, mesmo que a causa tenha sido corrigida.
 
-A segunda migration acrescenta referências e valida no banco a identidade completa, tipo, estado processado e valor integral da referência. Um índice único parcial em `(reference_transaction_id, kind)` para reversões processadas impede duplicação mesmo em SQL concorrente. Reversões rejeitadas permanecem auditáveis sem ocupar essa unicidade. O downgrade restaura as constraints/funções anteriores, mas recusa execução quando há histórico da Etapa 2: apagar esse histórico para satisfazer o schema antigo violaria a auditoria. A migration inicial permanece inalterada.
+DTOs HTTP/SQS compartilham a rejeição de NUL. Headers e identificadores de negócio em rotas também são verificados. Erros SQL de integridade não são convertidos genericamente em 400. CorrelationId é opcional, tem até 128 caracteres, sem NUL ou espaços nas extremidades; no SQS, omissão usa messageId.
 
-Essa verificação adicional soma o histórico da wallet no commit: custo O(n) por wallet, aceitável para o volume do desafio, mas seria preciso medir antes de adotar em produção. O serviço ainda usa lock explícito: constraints não substituem o controle de concorrência. O usuário de produção não deve ter privilégios para desabilitar triggers ou alterar schema; o Compose usa credenciais locais de desenvolvimento.
+## Transação, locks e ledger
 
-Abertura positiva gera `OPENING` interno e crédito, mantendo versão 1. Abertura zero não gera transação/ledger. Apenas alterações efetivas de saldo incrementam a versão; `LOSS` e rejeições não incrementam. `BET/WIN` exigem valor positivo; `LOSS` aceita valor não negativo apenas como informação, sem efeito financeiro.
+Uma operação usa `READ COMMITTED` e `SELECT FOR UPDATE` na wallet. Leitura, decisão, transação financeira, saldo, ledger e eventos ficam no mesmo commit. A inserção da operação ocorre depois do lock da wallet para evitar upgrades concorrentes dos locks da FK. `ON CONFLICT DO NOTHING` permite consultar a operação vencedora em novo statement sem manter uma transação abortada. A unidade de lock é a wallet, sem lock global.
 
-## Idempotência e estados
+Unicidades no schema protegem player/moeda, chave global, provider/ID externo, transação do ledger e reversão por referência/tipo. Há FKs, escala, não-negatividade, aritmética dos lançamentos e proteção da versão da wallet. Triggers impedem UPDATE/DELETE/TRUNCATE do ledger e alteração de transações terminais. Constraint triggers diferidos conferem vínculo financeiro/ledger e `wallet.balance = soma do ledger` no commit.
 
-O header é obrigatório, global e não é derivado silenciosamente. SHA-256 recebe UTF-8 de JSON canônico dos campos validados de negócio: provider, ID externo, player, wallet, round, game, kind e money. Chaves de objetos são ordenadas recursivamente; strings e arrays preservam conteúdo/ordem. Header e transporte ficam fora do hash. Campos extras são recusados pela API.
+A soma adicional custa O(n) por wallet. Não causou timeout nos cenários exercitados, mas histórico longo exige medição antes de produção. O usuário de aplicação não deve ter privilégios para desabilitar triggers ou alterar schema; o Compose usa credenciais de desenvolvimento.
 
-Mesmo header + mesmo payload retorna ID, status, falha e **saldo originais** persistidos, mudando apenas `idempotentReplay` para true. Mesmo header com outro payload retorna `IDEMPOTENCY_CONFLICT` (409). Mesmo provider/ID externo com outra chave retorna `EXTERNAL_TRANSACTION_CONFLICT` (409), mesmo que o payload seja igual. Operações rejeitadas também são persistidas e reproduzidas; um depósito posterior não transforma a mesma aposta rejeitada em débito.
+Abertura positiva cria OPENING interno e crédito, com versão 1; abertura zero não cria movimento. Somente mudanças de saldo incrementam versão. LOSS e rejeições não geram ledger. BET/WIN exigem valor positivo; LOSS permite valor não negativo informativo.
 
-`PENDING → PROCESSED | REJECTED | PENDING_REFERENCE` ocorre dentro da transação SQL, sem `PENDING` confirmado isoladamente. Uma pendência pode continuar em `PENDING_REFERENCE` ou terminar em `PROCESSED/REJECTED`. Estados terminais não admitem nova transição. `FAILED` está reservado para falhas permanentes auditáveis da etapa de mensageria; não é emitido pelo fluxo atual. Falhas transitórias fazem rollback e permitem reenvio com a mesma chave.
+## Idempotência, referências e estados
 
-O hash inclui `referenceExternalTransactionId` quando informado e mantém o algoritmo anterior para operações sem referência. Replay de pendência reflete o estado atual e mantém o saldo da aceitação enquanto aguarda; após aplicação ou rejeição, conserva o resultado terminal. Reenviar HTTP não consome tentativas nem antecipa a agenda.
+Mesmo header/payload retorna ID, estado e saldo originais, com replay indicado. Outra chave para o mesmo provider/ID externo é conflito, assim como a mesma chave com outro payload. As garantias estão no PostgreSQL, não em cache ou FIFO.
 
-| Código de rejeição (422) | Motivo |
+`PENDING → PROCESSED | REJECTED | PENDING_REFERENCE` ocorre dentro da transação. Pendências podem continuar aguardando ou terminar. Estados terminais são imutáveis. `FAILED` permanece reservado: falhas que impedem commit fazem rollback/retry e, quando esgotadas, são auditadas por DLQ/logs; não se cria uma transação artificial depois do rollback.
+
+Referências são resolvidas exclusivamente por `(providerId, referenceExternalTransactionId)`. Um ID em outro provider continua ausente no escopo consultado. A referência deve coincidir com player, wallet, moeda e rodada. REFUND aceita BET; ROLLBACK aceita BET/WIN/REFUND e inverte o efeito; WIN referenciado aceita BET. Reversões exigem valor integral e permitem uma aplicação por tipo sobre a mesma referência, conforme o enunciado.
+
+| FailureCode | Significado |
 | --- | --- |
-| `INSUFFICIENT_FUNDS` | Saldo insuficiente para BET |
-| `PLAYER_MISMATCH` | Player não é o dono da wallet |
-| `CURRENCY_MISMATCH` | Moeda da operação difere da wallet |
-| `BALANCE_LIMIT_EXCEEDED` | Crédito excederia o limite monetário |
-| `INVALID_REFERENCE` | Autorreferência ou identidade externa incompatível |
-| `REFERENCE_*_MISMATCH` | Provider, player, wallet, moeda, rodada, tipo ou valor incompatível com a referência |
-| `REFERENCE_NOT_PROCESSED` | Referência terminal não processada, ou ainda pendente ao esgotar tentativas |
-| `REFERENCE_ALREADY_REVERSED` | Já houve reversão processada do mesmo tipo |
-| `REFERENCE_NOT_FOUND` | Referência ausente ao esgotar as tentativas |
+| `INSUFFICIENT_FUNDS` | BET sem saldo |
 | `REVERSAL_INSUFFICIENT_FUNDS` | Reversão produziria saldo negativo |
+| `PLAYER_MISMATCH`, `CURRENCY_MISMATCH` | Identidade da operação incompatível com a wallet |
+| `BALANCE_LIMIT_EXCEEDED` | Crédito ultrapassaria o limite |
+| `INVALID_REFERENCE`, `REFERENCE_*_MISMATCH` | Autorreferência ou identidade/tipo/valor incompatível |
+| `REFERENCE_ALREADY_REVERSED` | Reversão do mesmo tipo já processada |
+| `REFERENCE_NOT_FOUND` | Referência ausente ao esgotar tentativas |
+| `REFERENCE_NOT_PROCESSED` | Referência rejeitada/falha, ou ainda pendente no esgotamento |
 
-Moeda diferente chega ao caso de uso como rejeição auditável; o contrato HTTP desta etapa recusa moedas além de BRL com 400. Payload malformado ou wallet inexistente não é uma operação aceita e não cria transação.
+O worker seleciona primeiro wallet, depois transação, com `SKIP LOCKED`, preservando a ordem de locks do caso HTTP. Agenda/tentativas são persistidas. São oito reprocessamentos com backoff de 5 segundos até 300 segundos, cerca de 15 minutos com serviço disponível. O limite é por tentativas, não TTL; indisponibilidade prolonga o prazo. Falha SQL desfaz também o contador. Replay não antecipa a agenda. Após commit, resolução/expiração geram log estruturado com identidade, correlação, estado e failureCode disponível; tentativas confirmadas alimentam a métrica de latência existente.
 
-## Referências e worker
+## Inbox, outbox e entrega
 
-A resolução consulta exclusivamente `(providerId, referenceExternalTransactionId)`. Um ID existente apenas em outro provider é uma referência ausente nesse escopo; aguarda e eventualmente expira. Não consultamos outro provider para inferir rejeição. Referências resolvidas precisam coincidir com player, wallet, moeda e rodada. REFUND aceita BET; ROLLBACK aceita BET/WIN/REFUND; WIN referenciado aceita BET. Igualdade de valor é exigida somente nas reversões. REFUND e ROLLBACK da mesma BET podem ocorrer uma vez cada, seguindo a regra por tipo da seção 7 do enunciado.
+O consumer valida o envelope e abre a transação da inbox por `(consumerName, messageId)`. A mesma transação SQL contém operação, saldo, ledger, recibo e eventos. O ack ocorre somente depois do commit; falha no ack permite redelivery sem novo efeito financeiro. Inbox conflitante é erro permanente.
 
-HTTP e worker reutilizam `applyTransaction` com o mesmo `EntityManager`: saldo, ledger, status e agenda são confirmados juntos. O worker primeiro seleciona uma wallet com pendência vencida usando `FOR UPDATE SKIP LOCKED`, depois bloqueia sua transação. Essa ordem também é usada no HTTP, evitando ciclos de locks. A próxima tentativa é gravada antes de liberar o lock; outra instância encontra o novo estado. O controle local de execução do timer apenas evita trabalho sobreposto na própria instância.
+Os quatro eventos concretos herdam `IntegrationEvent`, com envelope versionado e Money como strings. OPENING gera eventos; LOSS produz somente Processed. PendingReference é emitido uma vez; resolução/expiração geram o evento terminal. O worker recupera a correlação original do evento pendente. Há unicidade por transação/tipo e proteção de payload/identidade no banco.
 
-O agendador roda a cada segundo, até 25 operações por rodada. São oito reprocessamentos por pendência, com backoff exponencial de 5 segundos limitado a 300 segundos: cerca de 15 minutos de espera com serviço disponível. O limite curto mantém a recuperação verificável no desafio; em produção dependeria do contrato de atraso dos provedores. Indisponibilidade prolonga esse prazo, pois o limite é por tentativas, não TTL. Falha SQL faz rollback também do contador; após reinício outra instância usa a agenda persistida. No shutdown, o timer é cancelado e o lote em andamento termina antes do encerramento do DataSource.
+O publisher mantém lock de uma linha da outbox via `FOR UPDATE SKIP LOCKED` durante envio e confirmação. Não bloqueia wallet; ocupa uma conexão durante chamada de rede, limitada a cinco segundos. Essa opção evita protocolo de lease adicional. Backoff persistido vai de 1 segundo a 5 minutos, sem descarte por esgotamento. Tentativas contabilizam resultados confirmados; uma tentativa interrompida pode voltar sem incremento por rollback.
 
-Os testes de expiração fornecem o instante ao reprocessamento para avançar a agenda sem esperar minutos; estado, locks e constraints continuam no PostgreSQL real. Um teste adicional usa o timer real. Os cenários concorrentes usam três pools independentes e chamadas paralelas, sem mocks de banco.
+Não há transação distribuída SQL/SQS. Morte depois do envio e antes da confirmação pode repetir o mesmo eventId. Deduplication IDs de transporte são distintos por tentativa; o consumidor externo deve deduplicar por eventId. Publishers podem alterar a ordem de eventos da wallet; `walletVersion` informa a sequência financeira nos eventos de saldo.
 
-## Reconciliação
+## Falhas, shutdown e observabilidade
 
-`POST /wallets/:walletId/reconciliation` usa uma única consulta com agregação do ledger. O snapshot do statement PostgreSQL inclui saldo e lançamentos confirmados no mesmo instante, mesmo com movimentações concorrentes. Soma e diferença são calculadas como `numeric` no PostgreSQL e serializadas como strings, inclusive divergências fora do limite operacional de Money. Apenas a contagem de lançamentos usa `number`.
+As filas de solicitações, DLQ e eventos são separadas. Erros financeiros são resultados terminais persistidos com ack. Contratos inválidos, recursos inexistentes ou conflitos seguem à DLQ explicitamente antes de remover o original; falha nesse intervalo também pode duplicar a cópia. Falhas transitórias têm backoff por visibilidade e redrive após cinco recebimentos. Visibilidade normal: 60 segundos com heartbeat. Os testes privados usam três recebimentos para acelerar a verificação. Redrive operacional não tem endpoint automático.
 
-Divergências não provocam correção. Geram log estruturado com walletId e incrementam um contador por processo exposto em `/metrics`; esse contador reinicia com a aplicação, como contadores usuais de métricas. O teste de corrupção desabilita temporariamente apenas o trigger de consistência de wallets no schema isolado de teste, e restaura o saldo manualmente depois da verificação; a aplicação não possui esse caminho.
+Cada instância consome uma mensagem por vez e publica até 25 eventos por rodada. Em SIGTERM, para novas buscas e aguarda trabalho em andamento antes de fechar o DataSource. O Compose concede 45 segundos. Em morte forçada, visibilidade expira e locks SQL são liberados; estado persistido decide a retomada.
 
-## Limites e próximos passos
+Logs JSON usam os identificadores disponíveis, sem payload financeiro completo. Métricas cobrem estados, duplicatas, retries, DLQ aproximada, locks, publicações, pendências/lag e latência. Contadores são por processo. Liveness verifica processo; readiness consulta PostgreSQL e as três filas, sem autenticação.
 
-Não há autenticação. `ProviderAuthGuard` é o ponto de extensão explícito: uma implementação futura validaria tokens OIDC de IdP externo e autorizaria o provider da requisição; não haverá tabela própria de senhas. A API local confia no provider informado.
+Reconciliação usa uma única consulta agregada: saldo e ledger pertencem ao mesmo snapshot. Diferença é armazenado menos calculado, em `numeric`; contagem de entradas usa number. Divergências geram resposta, log e métrica, sem correção automática. Paginação crescente usa cursor com wallet/sequence e não representa snapshot entre páginas.
 
-## Inbox, eventos e entrega
+## Migrations e limites operacionais
 
-O consumidor valida o envelope e usa `InboxProcessor`, que abre a transação SQL e insere `(consumerName, messageId, payloadHash)`. O hash canônico inclui campos de negócio e a chave de idempotência; horário e correlação de transporte ficam fora. Uma entrega idêntica já confirmada não executa o financeiro novamente. O mesmo messageId com payload diferente é conflito permanente e vai à DLQ, preservando o recibo original.
+As três migrations são versionadas. Down/up completo é suportado em schema vazio. O comando de downgrade mantém locks de tabela na mesma transação da verificação e recusa apagar histórico financeiro/inbox/outbox. A migration de referências recusa histórico incompatível com o schema anterior. Chamadas diretas ao ORM por um administrador continuam capazes de executar os `down` destrutivos originais; use o comando documentado.
 
-`FinancialService.process` aceita o EntityManager da transação externa somente quando ela está ativa. HTTP abre sua própria transação; SQS passa a da inbox. As regras financeiras continuam em `applyTransaction`. Os eventos são inseridos no mesmo commit da transação, ledger e saldo. Falha na outbox desfaz inclusive a inbox. O ack é posterior a esse commit, e uma falha no ack permite redelivery sem novo débito/crédito.
+O LocalStack 4.10.0 utilizado não demonstrou durabilidade SQS após restart, mesmo com volume, persistência habilitada, snapshots explícitos e encerramento com prazo de 45 segundos. O diagnóstico mede esse comportamento; a aceitação estrita exige sobrevivência e falha quando há perda. A configuração é de desenvolvimento. A investigação e suas fontes estão em [docs/VALIDATION.md](docs/VALIDATION.md).
 
-Os quatro eventos concretos herdam `IntegrationEvent`, com `eventType/version` definidos na classe e Money serializado como strings. `eventId` é também o ID da outbox e permanece estável entre tentativas. Há unicidade por transação e tipo de evento. OPENING gera eventos; LOSS gera somente `WagerTransactionProcessed`. Pendência gera um evento na entrada no estado, e sua resolução/expiração gera o evento terminal correspondente. A correlação original do worker de referências é recuperada do evento de pendência persistido.
+A outbox recupera eventos pendentes no PostgreSQL. Eventos já marcados como publicados permanecem auditáveis no SQL, mas não são reenviados automaticamente caso o broker perca dados. Solicitações ainda não confirmadas dependem da retenção do broker ou reenvio do produtor. Durabilidade efetiva do broker e recuperação operacional são necessárias para uso real. Não há backfill de eventos anteriores à instalação da outbox nem replay administrativo.
 
-O publisher seleciona uma linha da outbox com `FOR UPDATE SKIP LOCKED`, publica e confirma o resultado na mesma transação SQL. O lock fica na linha da outbox durante a chamada SQS, sem bloquear a wallet. Essa escolha evita leases e seus protocolos adicionais; o custo é ocupar uma conexão durante a chamada de rede, limitada a cinco segundos. Falhas agendam backoff persistido de 1 segundo até 5 minutos. Não há limite que apague/descarte eventos confirmados; lag e pendências permitem diagnosticar falhas prolongadas.
-
-Não existe transação distribuída PostgreSQL/SQS. Se o envio chegou ao broker e o processo morreu antes do commit SQL, a linha volta a ficar pendente e é publicada novamente com o mesmo eventId. A deduplicação FIFO não é uma garantia de integridade; as tentativas têm deduplication IDs de transporte distintos. Os consumidores dos eventos precisam deduplicar por eventId. Publicadores concorrentes podem alterar a ordem de envio de eventos da mesma wallet; `walletVersion` e o ledger permitem interpretar mudanças sem depender dessa ordem.
-
-Tentativas contabilizam resultados confirmados no PostgreSQL, inclusive publicação bem-sucedida. Uma tentativa interrompida pode reaparecer sem incremento porque sua transação foi desfeita. A imutabilidade de payload/identidade e as transições de inbox/outbox são protegidas por triggers. O downgrade de inbox/outbox remove histórico de entrega e não deve ser aplicado sobre eventos que ainda precisam ser preservados. Não há backfill de eventos das Etapas 1/2 já confirmados antes da migration.
-
-## SQS, falhas e shutdown
-
-LocalStack usa credenciais fictícias e três filas FIFO separadas. Solicitações têm visibilidade de 60 segundos com heartbeat; erros transitórios ajustam a visibilidade com backoff de 1 até 60 segundos. O broker encaminha à DLQ após cinco recebimentos. Erros permanentes de contrato, identidade ou integridade são enviados à DLQ explicitamente; o original só é removido depois desse envio. Uma falha entre envio à DLQ e remoção também pode gerar cópias. A DLQ preserva o envelope para análise/redrive; esse redrive é operacional, sem endpoint de reexecução automática.
-
-Rejeições financeiras são terminais, com inbox e evento persistidos, e recebem ack. Falhas que impedem commit não deixam uma transação financeira aceita no banco: a evidência fica no envelope da DLQ e nos logs, sem criar `FAILED` artificial após rollback. `FAILED` continua reservado no modelo. A indisponibilidade temporária do PostgreSQL faz o consumer tentar novamente; a do SQS impede ack/envio e permite recuperação posterior. A outbox nunca considera a ausência de resposta como publicação confirmada.
-
-Cada instância processa uma mensagem de entrada por vez e pode publicar até 25 eventos por rodada. O polling usa long polling de dois segundos. Em SIGTERM, Nest chama os hooks: o consumer interrompe novas buscas e conclui a mensagem em andamento; publishers e worker de referências param de selecionar novos itens, aguardando a operação atual antes do DataSource fechar. O Compose concede 45 segundos. Morte forçada continua segura: leases de visibilidade expiram, locks SQL são liberados e o estado persistido decide a próxima ação.
-
-Logs JSON contêm os identificadores disponíveis de correlação, mensagem, transação, wallet e provider, sem payload financeiro completo. `/metrics` expõe estado das transações, duplicatas, retries, encaminhamentos explícitos à DLQ, profundidade aproximada da DLQ (inclusive redrive do broker), conflitos de lock, publicações, pendências/lag da outbox e latência. Contadores locais reiniciam com o processo; estado financeiro e lag vêm do banco. `/health/live` verifica o processo; `/health/ready` consulta PostgreSQL e as três filas, sem autenticação.
-
-Os testes usam PostgreSQL e LocalStack reais, filas/schemas exclusivos e Toxiproxy para interromper conexões apenas dos clientes de teste. Fixtures isoladas suspendem um processo após commit/antes de ack e após publicação/antes do commit, que o teste encerra com SIGKILL. Isso comprovou um débito e publicação repetida com eventId estável, respectivamente. O shutdown com mensagem em andamento é verificado pelo hook real, com uma barreira de teste após o commit. O timer e os efeitos de banco/fila não são substituídos por mocks.
-
-A validação distribuída usa três processos Bun executando a aplicação NestJS completa, com portas atribuídas pelo sistema. Cada conexão é identificada por `application_name`; o teste bloqueia uma wallet e verifica em `pg_stat_activity` que processos distintos aguardam locks antes de liberar a disputa. As 50 requisições HTTP são distribuídas entre os três servidores. As 50 entregas SQS têm IDs de deduplicação e grupos FIFO distintos: o broker não serializa nem elimina as cópias como garantia financeira. Após o reinício, cada consumer registra duplicatas, há um recibo de inbox e um débito; publishers retomam a outbox pendente. Um backlog maior que o lote de um publisher permite observar publicações em pelo menos dois processos. Wallets distintas concluem operações enquanto outra wallet continua bloqueada.
-
-O custo O(n) da conferência do ledger não provocou timeout nem inconsistência nesses cenários. Isso comprova o volume exercitado, sem estabelecer capacidade para histórico longo ou meta de throughput. Nenhuma otimização foi aplicada. A paginação usa sequência global crescente codificada com o walletId em base64url e não representa um snapshot: novos lançamentos podem aparecer nas páginas seguintes.
-
-O ciclo completo das três migrations down/up e a reaplicação sem alterações foram testados em schema vazio. O comando `migration:revert` verifica histórico e mantém locks de tabela até concluir o downgrade na mesma transação SQL; recusa remover inbox/outbox preenchidas ou tabelas financeiras com dados. A proteção específica da Etapa 2 permanece na própria migration. As implementações `down` originais da migration inicial e da outbox continuam destrutivas se invocadas diretamente pelo ORM por um administrador: use o comando documentado. O histórico não pode ser convertido automaticamente para um schema que não representa suas operações.
-
-O teste `test:broker` usa outro projeto Compose, porta dinâmica e volume exclusivo, com a mesma imagem e configuração de persistência. No LocalStack 4.10.0 executado aqui, filas, uma solicitação não consumida e dois eventos já publicados desapareceram após reiniciar o container. O volume foi preservado, mas `PERSISTENCE=1` não garantiu persistência SQS nesse ambiente. Não reiniciamos o broker utilizado manualmente.
-
-A outbox recuperou os dois eventos ainda não publicados a partir de uma nova conexão PostgreSQL. Os dois eventos já marcados como publicados permaneceram no histórico SQL e não foram republicados automaticamente. Portanto, a recuperação automática cobre falhas do publisher e eventos pendentes; não cobre perda de mensagens já aceitas pelo broker ou solicitações perdidas antes do commit. Para entrega fora do ambiente do desafio, é necessária durabilidade efetiva do broker e uma política operacional de reenvio/restauração. Não há replay administrativo implementado. Essa limitação local não altera as garantias de atomicidade e idempotência no PostgreSQL.
-
-Na validação em Windows, matchers assíncronos `expect(promise).rejects.toThrow` provocaram timeouts/crashes no Bun 1.4.3 e 1.3.14. Os testes de integração aguardam a operação em `try/catch` e verificam a exceção recebida. A suíte passou com esse formato no Bun 1.3.14, versão fixada para reprodução.
+Autenticação foi omitida conforme permitido no desafio. `ProviderAuthGuard` é o ponto de extensão para validar OIDC de IdP externo e autorizar provider; não haveria tabela própria de senhas. O canal SQS local é interno confiável, com identidade ainda validada pelo domínio.

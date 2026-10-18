@@ -1,81 +1,102 @@
-# Validação final
+# Evidências de validação
 
-Ambiente: Windows, Bun 1.3.14, PostgreSQL 18.1, LocalStack 4.10.0 e Toxiproxy 2.12.0. Os testes usam schemas e filas exclusivos; os testes de rede afetam somente os proxies. O teste de restart do broker usa outro projeto Compose. Dados e volumes manuais foram preservados.
+Código testado: **`bc05118`**, incluindo `fc6bb33` (identidade/validação) e `71bf8a2` (worker/concorrência). Alterações posteriores deste relatório são documentais. Execução em 18/10/2026, Windows, Bun 1.3.14, PostgreSQL 18.1, LocalStack 4.10.0 e Toxiproxy 2.12.0.
 
-Resultado: **96 testes aprovados** (38 unitários, 53 de integração, quatro distribuídos e um de broker), preservando os 90 anteriores. A execução conjunta de unidade/integração/distribuídos passou com 95 testes e 505 verificações; o teste isolado do broker passou separadamente com quatro verificações. Typecheck, build, build Docker e `bun install --frozen-lockfile` aprovados.
+## Resultado executado
 
-Após iniciar a imagem final, `/health/live` e `/health/ready` retornaram 200. A auditoria somente por leitura do ambiente principal confirmou zero wallets divergentes, 11 eventos publicados e zero pendentes. PostgreSQL e aplicação permaneceram ativos; PostgreSQL de testes e Toxiproxy foram encerrados sem remover volumes.
-
-## Auditoria e conformidade
-
-Antes das alterações, a auditoria das seções 4–14 encontrou: regras financeiras e entrega cobertas por 90 testes; concorrência comprovada apenas com pools no mesmo processo; ausência dos cenários de três aplicações e 50 duplicatas distribuídas; restart do broker não verificado; reversibilidade integral em banco vazio ainda não demonstrada. Havia também diferença entre a porta do Compose versionado (5432) e a URL de exemplo (55432).
-
-| Seção | Resultado e evidência |
+| Verificação | Resultado |
 | --- | --- |
-| 4 — stack/migrations | Bun, NestJS, TypeScript strict, TypeORM, PostgreSQL, SQS e Compose. Três migrations down/up em schema vazio; segundo up sem alterações. Downgrade com histórico tem pré-condições. |
-| 5 — restrições | Decimal strings/decimal.js/numeric; locks por wallet; inbox e idempotência no PostgreSQL; ledger imutável; outbox invisível antes do commit. |
-| 6 — domínio/schema | Factories/rehydrate, transições terminais, unicidades, escala e não-negatividade no banco; testes de violação direta das constraints. `FAILED` permanece reservado, sem emissão artificial após rollback. |
-| 7 — operações/referências | BET/WIN/LOSS/REFUND/ROLLBACK, identidade completa, reversão integral e única por tipo, rejeição específica de reversão sem saldo; agenda e expiração persistidas. |
-| 8 — concorrência | Três processos NestJS; barreira e locks observados no PostgreSQL; disputa de saldo e wallets distintas. |
-| 9 — HTTP | Endpoints, contratos, rejeições, conflitos, replay original, reconciliação consistente por snapshot e health cobertos. Autenticação omitida conforme seção 2, com guard de extensão. |
-| 10 — SQS/inbox | 50 entregas reais, um recibo e um débito; ack após commit, redelivery, retry/DLQ e shutdown. |
-| 11 — outbox | Gravação atômica, publishers concorrentes, backoff persistido; morte após envio repete o mesmo eventId. Durabilidade do broker local tem limitação descrita abaixo. |
-| 12 — observabilidade | Logs JSON, correlação, métricas de status/duplicatas/retries/DLQ/locks/lag/latência; live/ready separados, com dependências indisponíveis. |
-| 13 — testes | Suítes unitárias, PostgreSQL/SQS reais, rede interrompida, subprocessos mortos e três aplicações independentes. Comandos abaixo. |
-| 14 — eliminatórios | Nenhuma violação observada nos cenários executados: sem dinheiro em number, saldo negativo por race, efeito duplicado, idempotência em memória, dependência de instância única, publicação pré-commit ou ledger ausente. Banco e broker reais. |
+| Instalação com lockfile congelado | Aprovada, sem alteração de dependências |
+| Typecheck e build | Aprovados |
+| Build Docker | Aprovado |
+| Unidade, integração e distribuídos | **103 aprovados**, zero falhas, 596 verificações |
+| Diagnóstico de restart do broker | **2 aprovados**, oito verificações; aprovação mede diagnóstico/recuperação, não durabilidade |
+| Aceitação estrita de durabilidade | **1 falha**, zero aprovações: solicitação e dois eventos perdidos |
 
-## Resultados dos cenários
+Total: **105 testes aprovados e uma aceitação separada reprovada**. A suíte contém 39 unitários, 60 de integração, quatro distribuídos e dois diagnósticos de broker. As assertions originais de distribuição uniforme de duplicatas foram substituídas por participação comprovada, preservando unicidade e saldo. O antigo teste de broker foi separado em diagnósticos e aceitação estrita; perda não é contabilizada como sucesso de durabilidade.
 
-| Cenário | Resultado verificado |
+Os testes usam PostgreSQL e SQS reais, schemas/filas exclusivos e outro projeto Compose para restart do broker. Toxiproxy interrompe somente clientes de teste. Volumes de desenvolvimento não são removidos ou reiniciados pelos experimentos.
+
+A imagem corrigida foi iniciada após o build: liveness/readiness retornaram 200, com PostgreSQL e SQS disponíveis. Auditoria somente por leitura do banco de desenvolvimento encontrou zero wallets divergentes, 11 eventos publicados e zero pendentes.
+
+## Achados da auditoria
+
+| Achado | Estado | Evidência |
+| --- | --- | --- |
+| A1 — UUIDs | Corrigido | HTTP e SQS: abertura com player maiúsculo, BET com outra grafia, WIN com wallet maiúscula, REFUND, replay e eventos persistidos. Cursor/rotas/reconciliação aceitam grafias equivalentes. Hashes históricos não são reescritos; rejeição antiga permanece rejeitada. |
+| A2 — NUL | Corrigido | Campos de negócio retornam HTTP 400; mensagem malformada segue à DLQ, sem inbox/operação/efeito adicional. Payload válido posterior funciona. Headers, rotas e envelope também têm verificação. |
+| A3 — broker | Diagnóstico corrigido; durabilidade pendente | Dois modos de snapshot perdem dados; aceitação separada falha explicitamente. Outbox recupera apenas os eventos pendentes. |
+| A4 — worker | Corrigido | Logs terminais correlacionados e latência após commit. Falha injetada em constraint diferida impede log de sucesso/amostra confirmada e desfaz efeitos/tentativa. |
+| A5 — documentação | Corrigido por revisão | README orientado à execução do serviço, exemplos PowerShell, arquitetura e limitações; este relatório identifica a versão testada. |
+| A6 — correlationId | Corrigido | HTTP/SQS compartilham tamanho, bordas e NUL; testes de valores válidos/inválidos e fallback real para messageId. |
+| A7 — distribuição | Corrigido | Três PIDs/portas, três application_names aguardando locks antes da liberação e amostras de processamento em todos os processos. A soma continua em 49 duplicatas, sem exigir duplicatas em cada consumer. |
+
+## Invariantes e cenários reais
+
+| Cenário | Resultado |
 | --- | --- |
-| 100.00, duas BET de 80.00 em processos diferentes | Uma PROCESSED, outra REJECTED/INSUFFICIENT_FUNDS, saldo 20.00, um débito. |
-| 50 requisições HTTP iguais em três processos | Um ID de transação, uma resposta original e 49 replays, um débito e dois eventos. Após crédito posterior, replay conserva saldo original de 20.00. |
-| Wallets diferentes | Duas aplicações concluem enquanto a wallet da terceira permanece bloqueada. |
-| 50 cópias SQS após restart das aplicações | Três consumers registram duplicatas; soma de 49 duplicatas, uma inbox, um débito, saldo 20.00 e DLQ vazia. Grupos FIFO e deduplication IDs distintos. |
-| Backlog da outbox após restart | Eventos pendentes drenados; pelo menos dois processos publicam; cada linha confirma uma tentativa na execução normal, nenhum evento pendente ao final. |
-| Processo morto após commit/antes do ack | Redelivery reutiliza inbox; saldo e ledger mantêm um efeito. |
-| Publisher morto após envio/antes da confirmação SQL | Nova publicação com o mesmo eventId; confirmação posterior no PostgreSQL. |
-| PostgreSQL indisponível via TCP | Sem ack nem efeito confirmado; retomada confirma uma vez. |
-| SQS indisponível via TCP | Backoff persistido; publisher com nova conexão retoma eventos. |
-| Retry/DLQ | Contrato inválido segue à DLQ; falha transitória esgota redrive privado de três recebimentos (configuração principal: cinco). |
-| Referências fora de ordem | Resolução e expiração persistidas, eventos correlacionados sem repetir efeito. |
-| Consistência final | Saldo igual à soma do ledger em todos os schemas de cenários financeiros. |
+| Duas BET de 80.00 sobre 100.00 em processos diferentes | Uma PROCESSED, outra REJECTED/INSUFFICIENT_FUNDS; saldo 20.00, um débito |
+| 50 duplicatas HTTP em três aplicações | Um ID, um efeito, uma resposta original e 49 replays; saldo original preservado após crédito posterior |
+| Wallets distintas | Outras duas concluem enquanto a primeira permanece bloqueada |
+| 50 cópias SQS após reinício das aplicações | Uma inbox, um débito, saldo 20.00 e DLQ vazia; grupos FIFO/deduplication IDs distintos |
+| Publishers concorrentes | Pelo menos dois processos publicam backlog; cada evento confirma uma tentativa normal, sem pendências ao final |
+| Morte após commit/antes do ack | SIGKILL real; redelivery sem segundo efeito |
+| Morte após envio/antes da confirmação SQL | SIGKILL real; repetição do mesmo eventId e confirmação posterior |
+| PostgreSQL indisponível | Sem ack/efeito confirmado; retomada confirma uma vez |
+| SQS indisponível | Backoff persistido; nova conexão/publisher recupera pendências |
+| Retry/DLQ | Contrato inválido vai diretamente à DLQ; falha transitória esgota redrive privado de três recebimentos (principal: cinco) |
+| Referências fora de ordem | Resolução e expiração persistidas; eventos e logs correlacionados |
+| Atomicidade e constraints | Falha na outbox desfaz inbox/transação/saldo/ledger; evento não confirmado invisível a outro publisher; mutações do histórico recusadas |
+| Reconciliação | Snapshot consistente durante escrita; divergência simulada é sinalizada sem correção automática |
+| Migrations | Down/up em schema vazio; segundo up sem alterações; downgrade documentado recusa apagar histórico |
+| Invariante final | Nenhum saldo negativo ou efeito duplicado observado; saldo igual à soma do ledger nos schemas financeiros |
 
-Os testes existentes de crash usam SIGKILL real em subprocessos. Shutdown em andamento usa o hook real com barreira controlada; não representa um SIGTERM no exato intervalo entre commit e ack. O teste distribuído encerra as aplicações com SIGTERM entre as fases.
+Shutdown em andamento é testado pelo hook real com barreira controlada. O teste distribuído envia SIGTERM entre fases. Isso não equivale a testar SIGTERM exatamente entre commit e ack; essa janela é coberta por SIGKILL/redelivery.
 
-## Limitações e riscos
+## Investigação da durabilidade
 
-- No restart isolado, o LocalStack perdeu filas e mensagens mesmo com `PERSISTENCE=1` e volume preservado. Duas mensagens de eventos já publicados e uma solicitação não consumida não sobreviveram. A outbox recuperou dois eventos ainda pendentes; não republica automaticamente o histórico marcado como publicado. Durabilidade efetiva do broker e recuperação operacional são necessárias antes de uso real.
-- Consumidores de eventos devem deduplicar por eventId; ordem de publicação pode variar. Não há promessa de exactly-once.
-- Downgrade da Etapa 2 recusa histórico incompatível. O comando de migrations também recusa apagar histórico financeiro/inbox/outbox; chamadas diretas ao ORM por administradores continuam capazes de executar os `down` destrutivos originais. O rollback integral é demonstrado em banco vazio, sem converter/apagar histórico real.
-- A conferência do ledger continua O(n) por wallet. Não causou falha nos cenários executados; não foi feita caracterização com histórico longo nem benchmark de produção.
-- Autenticação, backfill de eventos anteriores à Etapa 3, replay administrativo e dashboards não foram adicionados. As métricas de contadores são por processo. Não houve merge nem push.
+Imagem inspecionada: `localstack/localstack:4.10.0`, digest `sha256:a65ee2a9d45a7a34a1f1faae515d2e577ce11210312c077700ccc82daefec238`.
+
+Foram executados três experimentos isolados: diagnóstico com estratégias padrão, diagnóstico com `SNAPSHOT_SAVE_STRATEGY=ON_SHUTDOWN`/`SNAPSHOT_LOAD_STRATEGY=ON_STARTUP` e aceitação estrita com estratégias explícitas. Todos usam `PERSISTENCE=1`, volume próprio, porta dinâmica e `docker compose restart --timeout 45 broker`, seguido de espera por disponibilidade.
+
+Nos três casos, o runtime confirmou persistência habilitada e um arquivo marcador no volume sobreviveu ao restart. Entretanto, uma solicitação não consumida e os dois eventIds previamente publicados não sobreviveram. A comparação usa os eventIds recebidos, não apenas a contagem aproximada da fila. O publisher com nova conexão recuperou exatamente dois eventos pendentes, sem reenviar o histórico publicado. Saldo/ledger continuaram consistentes.
+
+A imagem inspecionada não contém o módulo `localstack.pro`. A [documentação oficial atual de persistência](https://docs.localstack.cloud/aws/developer-tools/snapshots/persistence/) descreve snapshots, estratégias de save/load e configuração com imagem Pro. Essa documentação não prova, por si só, a causa interna da perda na versão 4.10.0. As evidências descartam perda do volume e insuficiência apenas dos parâmetros explícitos testados; não demonstram se a causa exata é ausência de suporte nessa edição ou um defeito da implementação. Não foram testadas edição licenciada, outras imagens/versões ou outros emuladores.
+
+**Durabilidade do broker não aprovada.** A outbox protege a publicação ainda pendente no SQL; não substitui retenção de mensagens já aceitas pelo broker nem recria solicitações perdidas antes do commit. Não há replay automático do histórico publicado para contornar o teste.
 
 ## Reprodução
 
-Com Bun 1.3.14 no PATH e Docker Compose v2:
+Arquivos alterados nesta revisão:
+
+- `src/application/financial-service.ts`, `src/application/reconciliation.service.ts`.
+- `src/http/dto.ts`, `src/http/financial.controller.ts`, `src/http/input-validation.ts`.
+- `src/messaging/inbox.processor.ts`, `src/messaging/request-message.ts`.
+- `test/integration/input-regressions.test.ts`, `test/integration/reference-observability.test.ts`.
+- `test/unit/messaging.test.ts`, `test/distributed/application.test.ts`.
+- `test/helpers/broker-restart.ts`, `test/broker/persistence.test.ts`, `test/broker/durability.acceptance.ts`.
+- `compose.broker-test.yaml`, `package.json`, `README.md`, `ARCHITECTURE.md`, `docs/VALIDATION.md`.
+
+Com Bun 1.3.14 no PATH, Docker Compose v2 e `.env` criado conforme o README:
 
 ```sh
-cp .env.example .env
-# PowerShell: Copy-Item .env.example .env
 bun install --frozen-lockfile
-docker compose up -d --wait postgres localstack
-docker compose run --rm --no-deps sqs-init
-bun run migration:run
-docker compose up --build -d app
-docker compose --profile test up -d --wait postgres-test toxiproxy
+docker compose --profile test up -d --wait postgres-test localstack toxiproxy
 bun run typecheck
 bun run build
-bun test test/unit
-bun run test:integration
-bun run test:distributed
+bun test --timeout 60000 test/unit test/integration test/distributed
 bun run test:broker
+bun run test:broker:durability
 ```
 
-Se 5432 estiver ocupada, ajuste `POSTGRES_PORT` e a porta de `DATABASE_URL` no `.env` para 55432 antes de iniciar. O ambiente de validação manteve 55432 localmente. `TEST_DATABASE_URL` usa o banco separado `jungle_test`, porta 5433. Para um único comando de testes após a infraestrutura:
+O último comando executa a aceitação separada e retorna erro na imagem validada. Seu arquivo termina em `.acceptance.ts`, fora da descoberta automática de `*.test.ts`. O diagnóstico termina em `.test.ts`. Não omita a falha de aceitação ao reportar resultados.
 
-```sh
-bun test --timeout 60000 test/unit test/integration test/distributed test/broker
-```
+`TEST_DATABASE_URL` precisa apontar para um banco terminado em `_test`; o exemplo usa `postgresql://jungle:jungle@localhost:5433/jungle_test`. Bun carrega `.env`. Sem arquivo, no PowerShell: `$env:TEST_DATABASE_URL='postgresql://jungle:jungle@localhost:5433/jungle_test'`. Os subprocessos exigem permissão de execução; testes do broker exigem acesso ao Docker. Portas HTTP e broker isolado são atribuídas pelo sistema. Para encerrar infraestrutura compartilhada de testes: `docker compose --profile test stop postgres-test toxiproxy`. Não use `down -v` no ambiente de desenvolvimento.
 
-O teste do broker declara timeout próprio de 120 segundos. Os subprocessos exigem permissão de execução e os testes do broker exigem acesso ao Docker. As portas HTTP dos três processos e a porta do broker isolado são dinâmicas. Para encerrar apenas a infraestrutura de testes compartilhada: `docker compose --profile test stop postgres-test toxiproxy`. Não execute `down -v` sobre o ambiente manual.
+## Conformidade e riscos restantes
+
+As seções 4–10 e 12 do enunciado têm implementação e testes dos mecanismos exigidos: stack, domínio, schema, dinheiro exato, operações, concorrência, idempotência, HTTP, inbox, logs/métricas/health. A seção 11 tem atomicidade, recuperação e publicação at-least-once validadas; a persistência do broker local após restart continua reprovada na verificação adicional. A seção 13 inclui testes reais, três processos e 50 duplicatas, com a falha de durabilidade explicitada.
+
+Nenhuma falha eliminatória financeira foi observada nos cenários executados. A perda de mensagens confirmadas pelo broker permanece um risco de entrega relevante e impede afirmar durabilidade ponta a ponta. Recomenda-se apresentar o núcleo financeiro com essa ressalva explícita; se sobrevivência ao restart do broker for condição de aceite, a entrega ainda tem essa pendência.
+
+Outros limites: custo O(n) do ledger não caracterizado com histórico longo; ordenação de publicação pode variar; consumidores externos devem deduplicar eventId; autenticação omitida conforme permitido; não há backfill/replay administrativo. Contadores são por processo. As chamadas diretas ao ORM por administradores podem contornar a proteção do comando de downgrade, conforme documentado na arquitetura.

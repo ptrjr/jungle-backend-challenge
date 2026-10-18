@@ -1,152 +1,123 @@
-# Jungle — núcleo financeiro
+# Jungle — processamento financeiro de apostas
 
-Implementação incremental do [desafio oficial](https://github.com/junglegaming/backend-challenge). O enunciado original está preservado em [docs/CHALLENGE.md](docs/CHALLENGE.md).
+Serviço para processar BET, WIN, LOSS, REFUND e ROLLBACK por HTTP ou SQS. Mantém saldo e ledger na mesma transação PostgreSQL, deduplica requisições e mensagens, reprocessa referências fora de ordem e publica eventos por transactional outbox.
 
-Operações financeiras, ledger, idempotência, concorrência por wallet, referências fora de ordem, reconciliação, SQS e inbox/outbox. A auditoria final e as evidências reproduzíveis estão em [docs/VALIDATION.md](docs/VALIDATION.md).
+Stack: Bun **1.3.14**, TypeScript strict, NestJS 11, TypeORM, PostgreSQL 18.1 e AWS SDK SQS. O ambiente local usa Docker Compose e LocalStack 4.10.0. O [enunciado](docs/CHALLENGE.md), as [decisões de arquitetura](ARCHITECTURE.md) e as [evidências de validação](docs/VALIDATION.md) complementam este guia.
 
-## Executar
+## Executar com Docker Compose
 
-Requisitos: Bun **1.3.14**, Docker e Docker Compose v2. A aplicação usa NestJS 11, TypeORM e PostgreSQL 18. Não há autenticação nesta etapa; use apenas em ambiente local.
+Requer Docker Desktop/Engine com Compose v2. Crie `.env` a partir de `.env.example` se ainda não existir:
+
+```powershell
+if (!(Test-Path .env)) { Copy-Item .env.example .env }
+docker compose up --build -d
+```
+
+Em shells Unix: `test -f .env || cp .env.example .env`. Se a porta 5432 estiver ocupada, configure `POSTGRES_PORT=55432` e a porta de `DATABASE_URL` no `.env`. Entre containers, PostgreSQL usa `postgres:5432`.
+
+O Compose inicia banco, broker, inicialização das filas, API e workers. O container da API aplica as migrations antes de iniciar. API: `http://localhost:3000`; health: `/health/live` e `/health/ready`. Credenciais AWS são fictícias (`test/test`).
+
+## Executar localmente com Bun
+
+Com Bun 1.3.14 no PATH e `.env` configurado:
 
 ```sh
 bun install --frozen-lockfile
-# PowerShell: Copy-Item .env.example .env
-cp .env.example .env
 docker compose up -d --wait postgres localstack
 docker compose run --rm --no-deps sqs-init
-```
-
-O padrão versionado é a porta PostgreSQL **5432**. Se estiver ocupada, defina `POSTGRES_PORT=55432` e ajuste a porta de `DATABASE_URL` no `.env`; a comunicação entre containers continua em `postgres:5432`. Bun e Compose carregam `.env` automaticamente. A configuração local desta validação foi preservada em **55432**, fora dos commits.
-
-```sh
 bun run migration:run
 bun run dev
 ```
 
-API em `http://localhost:3000`. Para iniciar tudo em containers:
+Pare a API em container com `docker compose stop app` antes de usar a porta 3000 localmente. `bun run build` gera `dist/`; `bun dist/main.js` executa a saída compilada. `bun run start` executa o fonte sem watch. Para várias instâncias, aplique migrations uma vez antes de iniciar os processos.
 
-```sh
-docker compose up --build -d
+`MESSAGING_ENABLED=true` habilita consumer e publisher. `REFERENCE_WORKER_ENABLED=false` desativa o worker de referências. A outbox é persistida mesmo com publicação desabilitada. `bun run migration:revert` desfaz uma migration; o comando recusa apagar histórico financeiro ou de entrega. O rollback completo exige schema vazio; veja as pré-condições na arquitetura.
+
+## Criar uma wallet e apostar
+
+Exemplo executável em PowerShell:
+
+```powershell
+$playerId = [guid]::NewGuid().ToString()
+$wallet = Invoke-RestMethod -Method Post -Uri http://localhost:3000/wallets -ContentType 'application/json' -Body (@{
+  playerId = $playerId
+  initialBalance = @{ amount = '100.00'; currency = 'BRL' }
+} | ConvertTo-Json)
+$externalId = [guid]::NewGuid().ToString()
+$headers = @{ 'Idempotency-Key' = "provider-a:$externalId"; 'X-Correlation-Id' = 'example-bet' }
+$bet = @{
+  providerId = 'provider-a'; externalTransactionId = $externalId
+  playerId = $playerId; walletId = $wallet.id
+  roundId = 'round-1'; gameId = 'game-1'; kind = 'BET'
+  money = @{ amount = '80.00'; currency = 'BRL' }
+} | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri http://localhost:3000/wagering/transactions -Headers $headers -ContentType 'application/json' -Body $bet
+Invoke-RestMethod -Method Post -Uri http://localhost:3000/wagering/transactions -Headers $headers -ContentType 'application/json' -Body $bet
+Invoke-RestMethod -Method Post -Uri "http://localhost:3000/wallets/$($wallet.id)/reconciliation"
 ```
 
-O Compose inicia PostgreSQL, LocalStack, inicialização das filas e aplicação. O container aplica migrations antes de iniciar a API. Para múltiplas instâncias, execute migrations separadamente uma vez. Não são necessárias credenciais reais da AWS: `.env.example` usa `test/test` e endpoints locais.
+A primeira aposta retorna saldo `20.00`; a segunda retorna o mesmo resultado com `idempotentReplay: true`. Valores monetários são strings com duas casas, até `999999999999999999.99`. A entrada aceita BRL. UUIDs de player e wallet são normalizados para minúsculas; identificadores de negócio e chaves preservam sua grafia. NUL é recusado nos campos textuais externos.
 
-```sh
-bun run build
-bun run start
-bun run migration:revert
-```
+REFUND exige `referenceExternalTransactionId` de uma BET processada. ROLLBACK aceita BET, WIN ou REFUND processados e inverte seu efeito. Use nova chave/ID externo e o valor integral da referência. Provider, player, wallet, moeda e rodada devem coincidir. Cada referência permite uma reversão por tipo. WIN pode referenciar uma BET. LOSS não movimenta saldo nem gera ledger.
 
-`build` gera `dist/`; `start` executa o fonte com Bun. Para executar a saída compilada: `bun dist/main.js`. `migration:revert` desfaz somente a última migration. O comando recusa remover tabelas com histórico financeiro ou de entrega; a migration de referências também recusa histórico incompatível com a versão anterior. O ciclo completo down/up foi testado em schema vazio. Pare os processos antes de administrar migrations; não use diretamente o ORM para contornar essas pré-condições.
+## API
+
+| Método | Caminho |
+| --- | --- |
+| POST | `/wallets` |
+| GET | `/wallets/:walletId` |
+| GET | `/wallets/:walletId/ledger?limit=50&cursor=...` |
+| POST | `/wagering/transactions` — `Idempotency-Key` obrigatório |
+| GET | `/wagering/transactions/:transactionId` |
+| GET | `/providers/:providerId/wagering/transactions/:externalTransactionId` |
+| POST | `/wallets/:walletId/reconciliation` |
+| GET | `/health/live`, `/health/ready`, `/metrics` |
+
+HTTP: 201 para wallet criada; 200 para consulta/operação/replay; 202 para `PENDING_REFERENCE`; 400 para contrato inválido; 404 para recurso inexistente; 409 para conflito; 422 para rejeição financeira persistida; 503 para infraestrutura temporariamente indisponível. Replays preservam resultados terminais, inclusive rejeições e saldo original.
+
+A reconciliação retorna `storedBalance`, `calculatedBalance`, `difference`, `consistent` e `checkedEntries`, sem corrigir divergências. A paginação usa cursor opaco crescente, sem prometer snapshot entre páginas.
+
+## SQS e eventos
+
+| Fila | Responsabilidade |
+| --- | --- |
+| `wager-transactions.fifo` | Solicitações financeiras |
+| `wager-transactions-dlq.fifo` | Contratos inválidos/conflitantes e tentativas esgotadas |
+| `wager-events.fifo` | Eventos publicados; não recebe solicitações financeiras |
+
+O [contrato de entrada](docs/CHALLENGE.md#10-processamento-por-sqs) contém `messageId`, `type: "WagerTransactionRequested"`, `occurredAt` e `data`. `data` tem os campos HTTP e `idempotencyKey`. `correlationId` é opcional; quando ausente, usa `messageId`. HTTP e SQS recusam correlationId vazio, com espaços nas extremidades, NUL ou mais de 128 caracteres.
+
+Inbox, operação, ledger e outbox são confirmados juntos; o ack vem após commit. Falhas transitórias têm backoff e redrive após cinco recebimentos. Contratos inválidos e conflitos seguem diretamente à DLQ. Visibilidade de 60 segundos é renovada durante o processamento.
+
+O worker de referências usa oito tentativas persistidas, com intervalos de 5, 10, 20, 40, 80, 160, 300 e 300 segundos. Esgotamento gera rejeição auditável. O publisher tenta novamente com backoff de 1 segundo até 5 minutos, sem descartar eventos pendentes. Consumidores de eventos devem deduplicar por `eventId`.
 
 ## Testar
 
+Com dependências instaladas e `.env` configurado:
+
 ```sh
+docker compose --profile test up -d --wait postgres-test localstack toxiproxy
 bun run typecheck
 bun run build
 bun test test/unit
-docker compose --profile test up -d --wait postgres-test localstack toxiproxy
-docker compose run --rm --no-deps sqs-init
 bun run test:integration
 bun run test:distributed
 bun run test:broker
 ```
 
-`TEST_DATABASE_URL` deve apontar para um banco separado cujo nome termine em `_test`. O valor de `.env.example` usa a porta **5433**. Os testes criam e removem seu próprio schema e não usam mocks do PostgreSQL. O usuário de teste precisa poder criar schemas. Sem a variável, a suíte falha explicitamente.
+`TEST_DATABASE_URL` aponta para banco descartável terminado em `_test` (exemplo: porta 5433, banco `jungle_test`). As suítes usam schemas/filas privados. Toxiproxy interrompe somente conexões de teste. Testes distribuídos iniciam três processos NestJS com portas livres; incluem 50 duplicatas HTTP/SQS e disputa de saldo. Testes de crash encerram subprocessos reais.
 
-`test:distributed` inicia três processos Bun/NestJS independentes em portas livres do sistema, com o mesmo schema PostgreSQL e filas privadas. Uma barreira SQL e `pg_stat_activity` comprovam sobreposição entre processos. Valida `80 + 80` sobre `100`, 50 duplicatas HTTP, wallets distintas e 50 duplicatas SQS após reinício. Os logs registram PIDs, portas e resultados. `test:broker` exige acesso ao Docker, cria um projeto Compose isolado com porta dinâmica, reinicia somente esse broker e encerra seus containers; mantém o volume criado pelo teste. Nenhum desses testes reinicia o broker principal nem remove volumes existentes.
-
-São cobertos: precisão decimal, transições, todas as operações, saldo insuficiente, identidade e validade de referências, replay com saldo original, duplicação e reversões concorrentes em três pools independentes, disputa `80 + 80` sobre `100`, falhas injetadas, constraints, imutabilidade, contratos HTTP, timeout de lock e paginação. Os novos testes incluem workers concorrentes, backoff/expiração, referências encadeadas, reconciliação concorrente/divergente e migration down/up preservando histórico anterior.
-
-Os testes criam filas e schemas privados. Toxiproxy interrompe conexões reais apenas dos clientes de teste. Dois testes criam e encerram subprocessos Bun em pontos controlados: após commit/antes de ack e após publicação/antes da confirmação SQL. No Windows, a execução precisa permitir criação de processos. `bunfig.toml` desativa os workers automáticos nos testes, inclusive se `.env` habilitar mensageria; os testes do agendador os iniciam explicitamente.
-
-Validação da Etapa 3 em Windows/Bun 1.3.14, PostgreSQL 18.1 e LocalStack 4.10.0 em containers: **38 testes unitários e 52 de integração aprovados**, mantendo os 68 testes anteriores. Typecheck, build e instalação com lockfile congelado passaram. O Compose também foi validado com envio real de solicitações SQS, duplicata, publicação dos eventos, ROLLBACK fora de ordem, reconciliação, métricas e health. O Bun local está em `.local/bun`, pasta ignorada pelo Git; instale a versão indicada no PATH para usar os comandos acima.
-
-O teste isolado de reinício detectou perda de filas e mensagens no LocalStack 4.10.0 utilizado, mesmo com `PERSISTENCE=1` e volume. Não há promessa de durabilidade desse broker local. A outbox recupera eventos ainda pendentes no PostgreSQL; eventos já marcados como publicados não são reenviados automaticamente, e solicitações ainda não confirmadas no SQL dependem da retenção do broker ou reenvio do produtor. Detalhes em [ARCHITECTURE.md](ARCHITECTURE.md).
-
-Validação final: **96 testes aprovados** — 38 unitários, 53 de integração, quatro distribuídos e um de reinício do broker. Os 90 anteriores continuam passando. Typecheck, build local/Docker e instalação com lockfile congelado aprovados. O teste de broker mede e registra a limitação acima; sua aprovação não significa persistência garantida.
-
-## API implementada
-
-| Método | Caminho | Resultado |
-| --- | --- | --- |
-| POST | `/wallets` | Cria wallet; crédito inicial positivo gera `OPENING` e ledger |
-| GET | `/wallets/:walletId` | Saldo atual e versão |
-| GET | `/wallets/:walletId/ledger?limit=50&cursor=...` | Ledger crescente por sequência; cursor opaco |
-| POST | `/wagering/transactions` | Processa `BET`, `WIN`, `LOSS`, `REFUND` ou `ROLLBACK` |
-| GET | `/wagering/transactions/:transactionId` | Consulta operação e saldo original |
-| GET | `/providers/:providerId/wagering/transactions/:externalTransactionId` | Consulta pela identidade externa |
-| POST | `/wallets/:walletId/reconciliation` | Compara saldo armazenado com a soma do ledger |
-| GET | `/metrics` | Métricas financeiras e de mensageria em formato Prometheus |
-| GET | `/health/live` | Processo vivo, sem consultar dependências |
-| GET | `/health/ready` | PostgreSQL e as três filas SQS disponíveis; 503 durante falha |
-
-Criar wallet:
-
-```json
-{
-  "playerId": "0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1",
-  "initialBalance": { "amount": "100.00", "currency": "BRL" }
-}
-```
-
-Enviar aposta para `POST /wagering/transactions`, com header obrigatório `Idempotency-Key: provider-a:transaction-123`. Substitua `walletId` pelo ID retornado na criação:
-
-```json
-{
-  "providerId": "provider-a",
-  "externalTransactionId": "transaction-123",
-  "playerId": "0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1",
-  "walletId": "0192f291-27dd-7d3f-8071-5f8685deef37",
-  "roundId": "round-987",
-  "gameId": "fortune-chimp",
-  "kind": "BET",
-  "money": { "amount": "80.00", "currency": "BRL" }
-}
-```
-
-Valores monetários são strings com **exatamente duas casas**, entre `0.00` e `999999999999999999.99`. A API aceita apenas BRL; o domínio suporta operações entre valores da mesma moeda. Operações financeiras exigem valor positivo. `LOSS` admite valor não negativo e nunca movimenta saldo nem gera ledger. `OPENING` e o provider `__internal__` são reservados.
-
-Para reverter uma aposta, envie os mesmos campos de identidade/rodada, um novo `externalTransactionId` e uma nova chave, com `kind: "REFUND"` e `referenceExternalTransactionId: "transaction-123"`. O valor deve ser integral e igual ao da referência. `ROLLBACK` aceita BET, WIN ou REFUND e inverte seu efeito; REFUND aceita somente BET. Cada referência admite uma reversão por tipo, conforme o enunciado. WIN aceita referência opcional a BET, sem exigir valor igual ao da aposta.
-
-Uma referência ainda ausente retorna **202 / PENDING_REFERENCE**, com `transactionId`, saldo observado na aceitação, `referenceAttempts` e `nextAttemptAt`. Consulte a transação pelo ID para acompanhar. O worker inicia com a aplicação, verifica pendências a cada segundo e usa até oito tentativas agendadas: intervalos de 5, 10, 20, 40, 80, 160, 300 e 300 segundos. O cronograma e as tentativas ficam no PostgreSQL. Em execução local com Bun, `REFERENCE_WORKER_ENABLED=false` desativa o agendador para testes ou manutenção.
-
-A reconciliação retorna `walletId`, `storedBalance`, `calculatedBalance`, `difference` (armazenado menos calculado), `consistent` e `checkedEntries`. Usa um único snapshot SQL, não altera saldos e registra divergências no log e em `wallet_reconciliation_divergences_total`.
-
-## Mensageria
-
-| Fila | Uso |
-| --- | --- |
-| `wager-transactions.fifo` | Solicitações de operações |
-| `wager-transactions-dlq.fifo` | Contratos inválidos/conflitantes e tentativas esgotadas |
-| `wager-events.fifo` | Eventos publicados pela outbox; nenhum consumo financeiro nessa fila |
-
-O contrato de entrada é o da seção 10 de [docs/CHALLENGE.md](docs/CHALLENGE.md): envelope com `messageId`, `type: "WagerTransactionRequested"`, `occurredAt` e `data`. `data` contém o mesmo payload HTTP e `idempotencyKey` obrigatório. `correlationId` é opcional no envelope; seu default é `messageId`. Para HTTP, pode ser enviado no header `X-Correlation-Id`.
-
-Salve um envelope válido em `request.json`. Para enviar, substitua `URL_RETORNADA` pelo resultado de `get-queue-url`, use o walletId como grupo e um novo ID de envio para cada chamada:
+`test:broker` é **diagnóstico**: mede perdas no restart e recuperação da outbox. A aceitação estrita é separada:
 
 ```sh
-docker compose exec -T localstack awslocal sqs get-queue-url --queue-name wager-transactions.fifo
-docker compose cp request.json localstack:/tmp/request.json
-docker compose exec -T localstack awslocal sqs send-message --queue-url URL_RETORNADA --message-group-id WALLET_ID --message-deduplication-id ID_DE_ENVIO_UNICO --message-body file:///tmp/request.json
+bun run test:broker:durability
 ```
 
-O consumidor grava inbox, efeitos financeiros e eventos na mesma transação; confirma a mensagem somente após commit. Rejeições de negócio são persistidas e confirmadas. Contratos malformados, wallet inexistente ou conflitos seguem diretamente à DLQ. Falhas transitórias usam mudança de visibilidade com backoff e redrive após cinco recebimentos; nos testes privados o limite é três para reduzir o tempo de execução. A visibilidade normal é 60 segundos, renovada enquanto a mensagem está em processamento.
+Essa aceitação falha se a solicitação ou qualquer evento esperado desaparecer. Não integra a descoberta automática de `*.test.ts`. Os testes de broker usam outro projeto Compose/porta dinâmica e preservam os volumes criados. Resultados e versão testada: [docs/VALIDATION.md](docs/VALIDATION.md).
 
-`MESSAGING_ENABLED=true` habilita consumidor e publisher. A outbox é gravada mesmo com publicação desabilitada. Eventos pendentes são publicados após commit, com tentativas persistidas e backoff de 1 segundo até 5 minutos, sem descarte por esgotamento. Consumidores externos devem deduplicar por `eventId`; uma falha depois do envio e antes da confirmação SQL pode produzir publicação repetida.
+## Limitações conhecidas
 
-O container aceita SIGTERM, para de buscar trabalho e aguarda operações em andamento; o Compose permite 45 segundos para shutdown. Os testes comprovam espera pelo trabalho em andamento e recuperação após morte forçada. A reinicialização do container da aplicação também foi executada, com readiness saudável ao retornar. Não há autenticação nesta etapa.
-
-| HTTP | Significado |
-| --- | --- |
-| 201 | Wallet criada |
-| 200 | Consulta, operação aplicada ou replay de operação aplicada |
-| 202 | Referência pendente; inclusive replay enquanto aguarda resolução |
-| 400 | Payload, referência obrigatória, header, ID ou cursor inválido |
-| 404 | Wallet/transação inexistente |
-| 409 | Wallet duplicada ou conflito de identidade/idempotência |
-| 422 | Rejeição de negócio persistida; replay conserva o mesmo resultado |
-| 503 | Falha transitória de infraestrutura reconhecida; reenviar com a mesma chave |
-| 500 | Erro inesperado |
-
-As decisões, códigos de falha e limitações estão em [ARCHITECTURE.md](ARCHITECTURE.md).
+- A aceitação de durabilidade do LocalStack 4.10.0 falha no ambiente validado, inclusive com estratégias de snapshot explícitas. Eventos pendentes no SQL são recuperáveis; eventos já marcados como publicados e solicitações perdidas pelo broker não são reenviados automaticamente.
+- A API não implementa autenticação. O guard de extensão está documentado na arquitetura; execute o Compose somente em ambiente local.
+- Não há backfill de eventos anteriores à instalação da outbox nem replay administrativo. Ordem de publicação pode variar entre publishers; não há exactly-once.
+- A conferência de saldo pelo ledger custa O(n) por wallet. O volume dos testes não representa benchmark de produção. Contadores de métricas são por processo.
