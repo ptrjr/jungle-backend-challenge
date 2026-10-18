@@ -1,11 +1,14 @@
 services:
   broker:
     image: localstack/localstack:4.10.0
+    stop_grace_period: 45s
     environment:
       SERVICES: sqs
       AWS_DEFAULT_REGION: us-east-1
       SQS_ENDPOINT_STRATEGY: path
       PERSISTENCE: "1"
+      SNAPSHOT_SAVE_STRATEGY: ${BROKER_SAVE_STRATEGY:-}
+      SNAPSHOT_LOAD_STRATEGY: ${BROKER_LOAD_STRATEGY:-}
     ports:
       - "127.0.0.1::4566"
     volumes:

@@ -15,6 +15,7 @@
     "test:integration": "bun test --timeout 30000 test/integration",
     "test:distributed": "bun test --timeout 60000 test/distributed",
     "test:broker": "bun test test/broker",
+    "test:broker:durability": "bun test ./test/broker/durability.acceptance.ts",
     "migration:run": "bun scripts/migrate.ts up",
     "migration:revert": "bun scripts/migrate.ts down"
   },
