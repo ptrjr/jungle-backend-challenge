@@ -1,0 +1,19 @@
+services:
+  broker:
+    image: localstack/localstack:4.10.0
+    environment:
+      SERVICES: sqs
+      AWS_DEFAULT_REGION: us-east-1
+      SQS_ENDPOINT_STRATEGY: path
+      PERSISTENCE: "1"
+    ports:
+      - "127.0.0.1::4566"
+    volumes:
+      - broker_test_data:/var/lib/localstack
+    healthcheck:
+      test: ["CMD", "awslocal", "sqs", "list-queues"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+volumes:
+  broker_test_data:
