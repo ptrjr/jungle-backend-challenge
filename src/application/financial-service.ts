@@ -109,25 +109,35 @@ export class FinancialService {
   }
 
   async reprocessPendingReference(now = new Date()): Promise<boolean> {
-    return this.source.transaction('READ COMMITTED', async manager => {
+    const started = performance.now();
+    const outcome = await this.source.transaction('READ COMMITTED', async manager => {
       // All financial paths lock wallet before transaction to avoid lock-order deadlocks.
       const row = await manager.createQueryBuilder(WalletEntity, 'wallet')
         .where(`EXISTS (SELECT 1 FROM wager_transactions t WHERE t.wallet_id = wallet.id
           AND t.status = 'PENDING_REFERENCE' AND t.next_attempt_at <= :now)`, { now })
         .orderBy('wallet.id', 'ASC').setLock('pessimistic_write').setOnLocked('skip_locked').take(1).getOne();
-      if (!row) return false;
+      if (!row) return undefined;
       const pending = await manager.createQueryBuilder(TransactionEntity, 'transaction')
         .where('transaction.walletId = :id AND transaction.status = :status AND transaction.nextAttemptAt <= :now', {
           id: row.id, status: WagerTransactionStatus.PendingReference, now,
         }).orderBy('transaction.nextAttemptAt', 'ASC').addOrderBy('transaction.id', 'ASC')
         .setLock('pessimistic_write').setOnLocked('skip_locked').take(1).getOne();
-      if (!pending) return false;
+      if (!pending) return undefined;
       const transaction = this.hydrateTransaction(pending);
       transaction.recordReferenceAttempt();
       const context = await pendingReferenceContext(manager, transaction.id);
       await this.applyTransaction(manager, this.hydrateWallet(row), transaction, now, context);
-      return true;
+      return { transaction, context };
     });
+    if (!outcome) return false;
+    messagingMetrics.observe((performance.now() - started) / 1000);
+    const { transaction, context } = outcome;
+    if (transaction.isTerminal()) {
+      this.logger.log({ code: 'REFERENCE_TRANSACTION_RESULT', transactionId: transaction.id,
+        walletId: transaction.walletId, providerId: transaction.providerId, correlationId: context.correlationId,
+        status: transaction.status, ...(transaction.failureCode ? { failureCode: transaction.failureCode } : {}) });
+    }
+    return true;
   }
 
   private async applyTransaction(manager: EntityManager, wallet: Wallet, transaction: WagerTransaction, now: Date, context: EventContext): Promise<void> {

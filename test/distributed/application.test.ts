@@ -177,7 +177,7 @@ test('three restarted consumers drain 50 SQS duplicates and concurrent publisher
     return pending === 0 ? true : undefined;
   }, 15000);
   const metrics = await Promise.all(processes.map(async p => (await (await fetch(`${p.url}/metrics`)).text())));
-  expect(metrics.every(text => /messaging_duplicates_total [1-9]\d*/.test(text))).toBe(true);
+  expect(metrics.every(text => /^processing_seconds_count [1-9]\d*$/m.test(text))).toBe(true);
   expect(metrics.reduce((sum, text) => sum + Number(text.match(/^messaging_duplicates_total (\d+)$/m)![1]), 0)).toBe(49);
   expect(metrics.filter(text => /^outbox_published_total [1-9]\d*$/m.test(text)).length).toBeGreaterThanOrEqual(2);
   expect(await fixture.sqs.deadLetterDepth()).toBe(0);
